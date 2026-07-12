@@ -1,0 +1,36 @@
+# grok_reg-protocol_cpa tool and task configuration
+
+[tools]
+python = "3.13"
+
+[env]
+_.python.venv = { path = ".venv", create = true }
+PROJECT_ROOT = "{{config_root}}"
+
+[tasks.deps]
+run = "uv sync"
+description = "Install project dependencies with uv"
+
+[tasks.check]
+run = "python -m py_compile grok_register_ttk.py register_cli.py web_dashboard.py cf_mail_debug.py"
+description = "Run Python syntax checks"
+
+[tasks.register]
+run = "uv run python -u register_cli.py"
+description = "Run the CLI account workflow"
+
+[tasks.batch10]
+run = "uv run python -u register_cli.py --count 10"
+description = "Run a ten-account CLI batch"
+
+[tasks.gui]
+run = "uv run python grok_register_ttk.py"
+description = "Start the legacy Tk desktop GUI"
+
+[tasks.web]
+run = "uv run python -u web_dashboard.py --open"
+description = "Start the local macOS-style web dashboard"
+
+[tasks.mail-debug]
+run = "uv run python cf_mail_debug.py"
+description = "Run the mail provider debug helper"

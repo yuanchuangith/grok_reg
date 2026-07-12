@@ -1,0 +1,264 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>Grok Account Studio</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="ambient ambient-one"></div>
+  <div class="ambient ambient-two"></div>
+
+  <main class="app-shell">
+    <aside class="sidebar">
+      <div class="window-controls" aria-hidden="true">
+        <span class="dot red"></span><span class="dot amber"></span><span class="dot green"></span>
+      </div>
+
+      <div class="brand">
+        <div class="brand-mark">G</div>
+        <div>
+          <strong>Grok Studio</strong>
+          <span>Account Console</span>
+        </div>
+      </div>
+
+      <nav class="nav-list" aria-label="主导航">
+        <button class="nav-item active" data-page="overview"><span>⌂</span>总览</button>
+        <button class="nav-item" data-page="mailboxes"><span>✉</span>邮箱池</button>
+        <button class="nav-item" data-page="accounts"><span>✓</span>成功账户</button>
+        <button class="nav-item" data-page="failures"><span>!</span>失败记录</button>
+        <button class="nav-item" data-page="proxy"><span>⇄</span>代理网络</button>
+        <button class="nav-item" data-page="tasks"><span>▶</span>任务中心</button>
+        <button class="nav-item" data-page="settings"><span>⚙</span>配置中心</button>
+      </nav>
+
+      <div class="sidebar-status">
+        <span class="status-light" id="serverLight"></span>
+        <div><strong id="serverText">正在连接</strong><small>仅限本机访问</small></div>
+      </div>
+    </aside>
+
+    <section class="workspace">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LOCAL CONTROL CENTER</p>
+          <h1 id="pageTitle">运行总览</h1>
+          <p id="pageSubtitle">账户、邮箱和凭证的实时状态</p>
+        </div>
+        <div class="top-actions">
+          <span class="task-pill" id="taskPill"><i></i><span>空闲</span></span>
+          <button class="icon-button" id="refreshButton" title="刷新">↻</button>
+        </div>
+      </header>
+
+      <div class="page-stack">
+        <section class="page active" id="page-overview">
+          <div class="metric-grid">
+            <article class="metric-card blue"><span class="metric-icon">✉</span><div><small>邮箱凭证</small><strong id="metricMailboxes">0</strong><p id="metricMailboxesHint">等待加载</p></div></article>
+            <article class="metric-card green"><span class="metric-icon">✓</span><div><small>成功账户</small><strong id="metricAccounts">0</strong><p id="metricAccountsHint">等待加载</p></div></article>
+            <article class="metric-card violet"><span class="metric-icon">◆</span><div><small>CPA 凭证</small><strong id="metricCpa">0</strong><p id="metricCpaHint">等待加载</p></div></article>
+            <article class="metric-card orange"><span class="metric-icon">!</span><div><small>失败记录</small><strong id="metricFailures">0</strong><p>可筛选并重新加入</p></div></article>
+          </div>
+
+          <div class="overview-grid">
+            <article class="panel hero-panel">
+              <div class="panel-heading"><div><p class="eyebrow">QUICK START</p><h2>开始新的注册任务</h2></div><span class="soft-badge" id="providerBadge">未配置</span></div>
+              <p class="muted">使用当前配置和邮箱池启动任务，成功的账户与 SSO 会实时写入主账本。</p>
+              <div class="quick-form">
+                <label><span>新增账户</span><input id="quickExtra" type="number" value="1" min="1" max="100"></label>
+                <label><span>并发线程</span><input id="quickThreads" type="number" value="1" min="1" max="10"></label>
+                <button class="primary-button" id="quickStart">启动注册</button>
+              </div>
+              <div class="hero-foot"><span id="proxyState">代理状态加载中</span><span id="cpaState">CPA 状态加载中</span></div>
+            </article>
+
+            <article class="panel activity-panel">
+              <div class="panel-heading"><div><p class="eyebrow">LIVE ACTIVITY</p><h2>最近任务</h2></div><button class="text-button" data-goto="tasks">查看日志</button></div>
+              <div class="activity-state" id="activityState">
+                <div class="activity-orb"><span>✓</span></div>
+                <strong>当前没有运行中的任务</strong>
+                <p>从快速启动或任务中心开始。</p>
+              </div>
+            </article>
+          </div>
+
+          <article class="panel data-health">
+            <div class="panel-heading"><div><p class="eyebrow">DATA HEALTH</p><h2>数据完整度</h2></div><span class="updated-at" id="updatedAt">—</span></div>
+            <div class="health-row"><div><strong>账户 SSO</strong><span>成功账户中已保留 SSO 的比例</span></div><div class="progress"><i id="ssoProgress"></i></div><b id="ssoPercent">0%</b></div>
+            <div class="health-row"><div><strong>CPA 覆盖</strong><span>成功账户中已生成 xai JSON 的比例</span></div><div class="progress"><i id="cpaProgress"></i></div><b id="cpaPercent">0%</b></div>
+          </article>
+        </section>
+
+        <section class="page" id="page-mailboxes">
+          <div class="toolbar panel compact">
+            <div><strong>邮箱凭证池</strong><span id="mailboxCount">0 条记录</span></div>
+            <div class="toolbar-actions">
+              <div class="search-box"><span>⌕</span><input id="mailboxSearch" placeholder="搜索邮箱"></div>
+              <button class="secondary-button" id="deleteMailboxes">删除所选</button>
+              <button class="primary-button" id="openImport">导入邮箱</button>
+            </div>
+          </div>
+          <article class="panel table-panel">
+            <div class="table-wrap">
+              <table><thead><tr><th class="check-cell"><input type="checkbox" id="selectAllMailboxes"></th><th>邮箱</th><th>Client ID</th><th>Token</th><th>已使用</th><th>失败</th><th>状态</th></tr></thead><tbody id="mailboxRows"></tbody></table>
+            </div>
+            <div class="empty-state" id="mailboxEmpty"><span>✉</span><strong>还没有邮箱凭证</strong><p>导入四段格式 TXT 文件后即可使用。</p></div>
+          </article>
+        </section>
+
+        <section class="page" id="page-accounts">
+          <div class="toolbar panel compact">
+            <div><strong>成功账户与凭证</strong><span id="accountCount">0 个账户</span></div>
+            <div class="toolbar-actions">
+              <div class="search-box"><span>⌕</span><input id="accountSearch" placeholder="搜索账户"></div>
+              <a class="secondary-button as-link" href="/api/export/accounts">导出账户</a>
+              <a class="primary-button as-link" href="/api/export/cpa">打包 CPA</a>
+            </div>
+          </div>
+          <article class="panel table-panel">
+            <div class="table-wrap">
+              <table><thead><tr><th>账户</th><th>密码</th><th>SSO</th><th>CPA</th><th>来源</th><th>操作</th></tr></thead><tbody id="accountRows"></tbody></table>
+            </div>
+            <div class="empty-state" id="accountEmpty"><span>✓</span><strong>还没有成功账户</strong><p>注册成功后会自动显示在这里。</p></div>
+          </article>
+        </section>
+
+        <section class="page" id="page-failures">
+          <div class="toolbar panel compact">
+            <div><strong>失败记录</strong><span id="failureCount">0 条记录</span></div>
+            <div class="toolbar-actions">
+              <div class="search-box"><span>⌕</span><input id="failureSearch" placeholder="搜索邮箱或原因"></div>
+              <a class="secondary-button as-link" href="/api/export/failures">导出记录</a>
+              <button class="primary-button" id="retryFailures">清除所选并重试</button>
+            </div>
+          </div>
+          <article class="panel table-panel">
+            <div class="table-wrap">
+              <table><thead><tr><th class="check-cell"><input type="checkbox" id="selectAllFailures"></th><th>邮箱</th><th>阶段</th><th>失败原因</th><th>来源</th><th>时间</th></tr></thead><tbody id="failureRows"></tbody></table>
+            </div>
+            <div class="empty-state" id="failureEmpty"><span>◎</span><strong>没有失败记录</strong><p>当前数据状态很好。</p></div>
+          </article>
+        </section>
+
+        <section class="page" id="page-tasks">
+          <div class="task-grid">
+            <article class="panel task-card">
+              <div class="task-icon blue">▶</div><div><p class="eyebrow">REGISTER</p><h2>注册新账户</h2><p>从邮箱池选择可用地址，执行注册并保存 SSO/CPA。</p></div>
+              <div class="form-grid"><label><span>新增数量</span><input id="registerExtra" type="number" value="1" min="1" max="100"></label><label><span>注册线程</span><input id="registerThreads" type="number" value="1" min="1" max="10"></label><label><span>Mint Workers</span><input id="registerMintWorkers" type="number" value="-1" min="-1" max="10"></label></div>
+              <button class="primary-button wide" id="startRegister">启动注册任务</button>
+            </article>
+            <article class="panel task-card">
+              <div class="task-icon violet">◆</div><div><p class="eyebrow">BACKFILL CPA</p><h2>补全 CPA 凭证</h2><p>为账本中尚未生成 xai JSON 的账户执行 OIDC mint。</p></div>
+              <div class="form-grid"><label><span>最大数量（0=全部）</span><input id="backfillLimit" type="number" value="0" min="0"></label><label><span>账户邮箱（可选）</span><input id="backfillEmail" type="email" placeholder="user@example.com"></label><label class="switch-label"><span>完成后 Probe</span><input id="backfillProbe" type="checkbox" checked><i></i></label></div>
+              <button class="secondary-button wide" id="startBackfill">开始补全</button>
+            </article>
+          </div>
+
+          <article class="panel terminal-panel">
+            <div class="terminal-head"><div><span class="terminal-dot red"></span><span class="terminal-dot amber"></span><span class="terminal-dot green"></span><strong>实时任务日志</strong></div><div><span id="taskStatusText">空闲</span><button class="danger-button" id="stopTask" disabled>停止任务</button></div></div>
+            <div class="terminal" id="taskLog"><div class="terminal-placeholder">等待任务启动…</div></div>
+          </article>
+        </section>
+
+        <section class="page" id="page-proxy">
+          <article class="panel proxy-control-card">
+            <div class="proxy-title-row">
+              <div><p class="eyebrow">PROXY WORKSPACE</p><h2>代理网络</h2><p>代理关闭时直接连接；开启后从 Clash 订阅或静态认证 IP 池中选择出口。</p></div>
+              <div class="proxy-head-actions"><span class="badge neutral" id="proxyRuntimeBadge">未运行</span><label class="master-switch"><span id="proxyEnabledLabel">代理已关闭</span><input id="proxyEnabledInput" type="checkbox"><i></i></label></div>
+            </div>
+            <div class="proxy-type-selector">
+              <button type="button" data-proxy-mode="clash_subscription"><span>⇄</span><div><strong>Clash 订阅</strong><small>多个订阅独立分组，节点可跨组选择</small></div></button>
+              <button type="button" data-proxy-mode="static_pool"><span>⌁</span><div><strong>静态 IP 代理</strong><small>账号密码认证代理，同样支持随机与测活</small></div></button>
+            </div>
+            <div class="proxy-shared-bar">
+              <label><span>节点验活网站</span><input id="proxyHealthUrlInput" value="https://accounts.x.ai/"></label>
+              <label class="random-switch"><div><strong>跨组随机</strong><small>开启后取消默认节点，每次任务重新随机验活</small></div><input id="proxyRandomInput" type="checkbox" checked><i></i></label>
+              <button class="secondary-button" id="refreshProxyPool">刷新节点</button>
+              <button class="primary-button" id="saveProxyConfig">保存并应用</button>
+            </div>
+          </article>
+
+          <div class="proxy-workspace-grid">
+            <aside class="panel proxy-source-panel">
+              <div id="subscriptionProxyPanel">
+                <div class="proxy-section-head"><div><p class="eyebrow">SUBSCRIPTIONS</p><h2>订阅分组</h2></div><span id="subscriptionCount">0 组</span></div>
+                <div class="source-add-form">
+                  <input id="subscriptionNameInput" placeholder="分组名称，如 NCloud">
+                  <input id="subscriptionUrlInput" type="password" placeholder="Clash / Mihomo 订阅链接">
+                  <button class="secondary-button" id="addSubscription" type="button">添加订阅</button>
+                </div>
+                <div class="proxy-source-list" id="subscriptionList"></div>
+              </div>
+
+              <div id="staticProxyPanel" class="hidden">
+                <div class="proxy-section-head"><div><p class="eyebrow">STATIC POOL</p><h2>静态 IP 池</h2></div><span id="staticProxyCount">0 条</span></div>
+                <p class="proxy-engine-note">静态认证代理由本机 Mihomo 内核统一转发，但不会使用 Clash 订阅中的任何节点。</p>
+                <label class="static-import-field"><span>批量导入</span><textarea id="staticProxyImport" rows="5" placeholder="每行一条：host:port:username:password"></textarea><small>账号和密码只保存在服务器，列表中会自动脱敏。</small></label>
+                <button class="secondary-button wide" id="addStaticProxies" type="button">导入到静态代理池</button>
+                <div class="proxy-source-list" id="staticProxyList"></div>
+              </div>
+
+              <details class="advanced-proxy">
+                <summary>高级运行设置</summary>
+                <div class="proxy-form-grid advanced-grid">
+                  <label><span>单节点超时（秒）</span><input id="proxyTimeoutInput" type="number" value="8" min="2" max="120"></label>
+                  <label><span>最多随机测试</span><input id="proxyMaxNodesInput" type="number" value="12" min="1" max="100"></label>
+                  <label><span>订阅刷新（秒）</span><input id="proxyRefreshInput" type="number" value="3600" min="300"></label>
+                  <label><span>Mixed Port</span><input id="proxyMixedPortInput" type="number" value="17890"></label>
+                  <label><span>Controller Port</span><input id="proxyControllerPortInput" type="number" value="19090"></label>
+                  <label><span>Mihomo 路径</span><input id="proxyMihomoPathInput" placeholder="自动查找"></label>
+                  <label><span>运行目录</span><input id="proxyRuntimeDirInput" value="./proxy_pool_runtime"></label>
+                </div>
+              </details>
+            </aside>
+
+            <main class="panel proxy-node-panel">
+              <div class="node-panel-head">
+                <div><p class="eyebrow">AVAILABLE NODES</p><h2>代理节点</h2><p id="proxyPoolSummary">保存配置后加载节点；点击卡片固定出口，点“测试”只测活不切换。</p></div>
+                <div class="node-status-pills"><span>当前 <strong id="proxyPoolNode">—</strong></span><span>可用 <strong id="proxyPoolAlive">0 / 0</strong></span></div>
+              </div>
+              <div class="proxy-node-groups" id="proxyNodeGroups"></div>
+              <div class="empty-state visible" id="proxyNodeEmpty"><div>⇄</div><strong>还没有可显示的代理节点</strong><p>先在左侧添加并启用代理来源，然后保存并应用。</p></div>
+            </main>
+          </div>
+        </section>
+
+        <section class="page" id="page-settings">
+          <div class="toolbar panel compact settings-toolbar">
+            <div><strong>配置中心</strong><span id="configPath">config.json</span></div>
+            <div class="toolbar-actions"><button class="secondary-button" id="reloadConfig">放弃修改</button><button class="primary-button" id="saveConfig">保存全部配置</button></div>
+          </div>
+          <nav class="panel config-module-tabs" id="configModuleTabs" aria-label="配置模块"></nav>
+          <div class="settings-note">敏感字段只保存在本机 <code>config.json</code>。每次保存前会自动生成时间戳备份。</div>
+          <div id="configGroups" class="config-groups"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop" id="importModal" aria-hidden="true">
+    <section class="modal">
+      <button class="modal-close" id="closeImport">×</button>
+      <div class="modal-icon">✉</div><p class="eyebrow">IMPORT MAILBOXES</p><h2>导入邮箱凭证</h2>
+      <p class="muted">支持每行 <code>邮箱----密码----ClientID----Token</code>。相同邮箱会用新凭证更新。</p>
+      <label class="drop-zone" for="mailFile"><input id="mailFile" type="file" accept=".txt,text/plain"><span>⇧</span><strong>选择 TXT 文件</strong><small id="mailFileName">或将文件拖放到这里</small></label>
+      <div class="import-preview"><label><span>导入方式</span><select id="importMode"><option value="append">追加并更新重复项</option><option value="replace">替换整个邮箱池</option></select></label><div><small>可识别记录</small><strong id="importPreviewCount">0</strong></div></div>
+      <button class="primary-button wide" id="confirmImport" disabled>确认导入</button>
+    </section>
+  </div>
+
+  <div class="modal-backdrop" id="credentialModal" aria-hidden="true">
+    <section class="modal credential-modal">
+      <button class="modal-close" id="closeCredential">×</button>
+      <div class="modal-icon greenish">✓</div><p class="eyebrow">ACCOUNT CREDENTIAL</p><h2 id="credentialTitle">账户凭证</h2>
+      <div class="credential-fields"><label><span>邮箱</span><div><code id="credentialEmail"></code><button data-copy-target="credentialEmail">复制</button></div></label><label><span>密码</span><div><code id="credentialPassword"></code><button data-copy-target="credentialPassword">复制</button></div></label><label><span>SSO</span><div><code id="credentialSso"></code><button data-copy-target="credentialSso">复制</button></div></label></div>
+    </section>
+  </div>
+
+  <div class="toast-stack" id="toastStack"></div>
+  <script src="/app.js" defer></script>
+</body>
+</html>
