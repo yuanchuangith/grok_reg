@@ -19,6 +19,7 @@ import random
 import re
 import string
 import json
+import contextlib
 
 from DrissionPage import Chromium, ChromiumOptions
 from DrissionPage.errors import PageDisconnectedError
@@ -109,6 +110,7 @@ _hotmail_refresh_locks_lock = threading.Lock()
 
 _EMAILS_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emails_used.txt")
 _EMAILS_ERROR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emails_error.txt")
+_SUCCESS_ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_cli.txt")
 _email_track_lock = threading.Lock()
 
 
@@ -135,9 +137,9 @@ def mark_error(email: str, password: str = "", reason: str = ""):
 
 
 def is_email_used(email: str) -> bool:
-    """检查邮箱是否已被使用或标记为失败。"""
+    """检查邮箱是否已成功注册、被使用或标记为失败。"""
     email_lower = email.strip().lower()
-    for fpath in (_EMAILS_USED_FILE, _EMAILS_ERROR_FILE):
+    for fpath in (_SUCCESS_ACCOUNTS_FILE, _EMAILS_USED_FILE, _EMAILS_ERROR_FILE):
         if os.path.exists(fpath):
             with open(fpath, encoding="utf-8") as f:
                 for line in f:
@@ -1440,7 +1442,7 @@ def _hotmail_is_alias_of_main(email_addr, main_email):
 
 def _hotmail_iter_tracked_emails():
     """Yield emails already persisted in success/error ledgers."""
-    for fpath in (_EMAILS_USED_FILE, _EMAILS_ERROR_FILE):
+    for fpath in (_SUCCESS_ACCOUNTS_FILE, _EMAILS_USED_FILE, _EMAILS_ERROR_FILE):
         if not os.path.exists(fpath):
             continue
         try:
@@ -2510,9 +2512,22 @@ def fill_email_and_submit(timeout=15, log_callback=None, cancel_callback=None):
     page = _get_page()
     raise_if_cancelled(cancel_callback)
     check_timeout(time.time())
-    email, dev_token = get_email_and_token()
+    email = dev_token = ""
+    for allocation_try in range(1, 21):
+        email, dev_token = get_email_and_token()
+        if not email or not dev_token:
+            raise Exception("获取邮箱失败")
+        if not is_email_used(email):
+            break
+        if log_callback:
+            log_callback(f"[REG-EMAIL-190] 邮箱已存在于成功/占用账本，跳过重复注册 email={email} attempt={allocation_try}/20")
+        with contextlib.suppress(Exception):
+            _hotmail_release_alias(email)
+        with contextlib.suppress(Exception):
+            _hotmail_token_map.pop(dev_token, None)
+        email = dev_token = ""
     if not email or not dev_token:
-        raise Exception("获取邮箱失败")
+        raise Exception("连续获取到已注册邮箱，无法分配新的可用邮箱")
     if log_callback:
         log_callback(f"[REG-EMAIL-200] 已创建邮箱 {email}")
     deadline = time.time() + timeout
@@ -2924,6 +2939,7 @@ def fill_profile_and_submit(timeout=120, log_callback=None, cancel_callback=None
     form_filled_once = False
     wait_cf_since = None
     last_cf_retry_at = 0.0
+    last_no_submit_log_at = 0.0
 
     while time.time() < deadline:
         raise_if_cancelled(cancel_callback)
@@ -2981,7 +2997,7 @@ const buttons = Array.from(document.querySelectorAll('button[type="submit"], but
 });
 const submitBtn = buttons.find((node) => {
     const t = (node.innerText || node.textContent || '').replace(/\\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') || t.includes('createaccount');
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('completesignup') || t === 'signup' || t.includes('createaccount');
 });
 
 // 必须等待 Cloudflare 校验通过后再提交
@@ -3076,12 +3092,10 @@ const buttons = Array.from(document.querySelectorAll('button[type="submit"], but
 });
 const submitBtn = buttons.find((node) => {
     const t = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
-    return t.includes('完成注册') || t.includes('创建账户') || t.includes('sign up') || t.includes('createaccount');
+    return t.includes('完成注册') || t.includes('创建账户') || t.includes('completesignup') || t === 'signup' || t.includes('createaccount');
 });
 if (!submitBtn) return 'no-submit-button';
-submitBtn.focus();
-submitBtn.click();
-return 'submitted';
+return 'ready-native-submit';
             """
         )
 
@@ -3121,13 +3135,63 @@ return String(cfInput.value || '').trim().length;
             human_sleep(0.8, cancel_callback)
             continue
 
-        if submit_state == "submitted":
-            if log_callback:
-                log_callback(f"[*] 已填写注册资料并提交: {given_name} {family_name}")
-            return {"given_name": given_name, "family_name": family_name, "password": password}
+        if submit_state == "ready-native-submit":
+            native_submit = None
+            try:
+                for element in page.eles("tag:button"):
+                    text = "".join(str(element.text or "").lower().split())
+                    if (
+                        text in {"完成注册", "创建账户", "completesignup", "signup", "createaccount"}
+                        and bool(element.states.is_displayed)
+                    ):
+                        native_submit = element
+                        break
+                if native_submit is not None:
+                    if log_callback:
+                        log_callback(f"[REG-PROFILE-301] 找到最终提交按钮 text={native_submit.text}")
+                    native_submit.click(by_js=False, timeout=4)
+                    if log_callback:
+                        log_callback(f"[REG-PROFILE-302] 已使用原生事件提交注册资料: {given_name} {family_name}")
+                    return {"given_name": given_name, "family_name": family_name, "password": password}
+            except Exception as exc:
+                if log_callback:
+                    log_callback(f"[REG-PROFILE-303] 原生提交失败，尝试脚本兜底 reason={exc}")
+
+            fallback_clicked = page.run_js(
+                r"""
+const buttons = Array.from(document.querySelectorAll('button[type="submit"], button'));
+const target = buttons.find((node) => {
+  const style = getComputedStyle(node);
+  const rect = node.getBoundingClientRect();
+  const visible = style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  const text = (node.innerText || node.textContent || '').replace(/\s+/g, '').toLowerCase();
+  return visible && !node.disabled && (text.includes('完成注册') || text.includes('创建账户') || text.includes('completesignup') || text === 'signup' || text.includes('createaccount'));
+});
+if (!target) return false;
+target.click();
+return true;
+                """
+            )
+            if fallback_clicked:
+                if log_callback:
+                    log_callback(f"[REG-PROFILE-304] 已使用脚本兜底提交注册资料: {given_name} {family_name}")
+                return {"given_name": given_name, "family_name": family_name, "password": password}
+
         wait_cf_since = None
         if submit_state == "no-submit-button" and log_callback:
-            log_callback("[Debug] 未找到提交按钮，继续等待页面稳定...")
+            now = time.time()
+            if now - last_no_submit_log_at >= 3:
+                visible_buttons = page.run_js(
+                    """
+return Array.from(document.querySelectorAll('button'))
+  .filter((node) => { const r = node.getBoundingClientRect(); return r.width > 0 && r.height > 0; })
+  .map((node) => (node.innerText || node.textContent || '').trim())
+  .filter(Boolean)
+  .slice(0, 10);
+                    """
+                )
+                log_callback(f"[REG-PROFILE-305] 未找到最终提交按钮 visible_buttons={visible_buttons}")
+                last_no_submit_log_at = now
 
         human_sleep(0.5, cancel_callback)
 

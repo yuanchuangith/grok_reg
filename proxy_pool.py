@@ -21,6 +21,8 @@ from typing import Any, Callable
 LogFn = Callable[[str], None]
 ROOT = Path(__file__).resolve().parent
 GROUP_NAME = "PROXY_POOL"
+SUBSCRIPTION_EXCLUDE_FILTER = "剩余流量|距离下次重置|套餐到期|请勿连接|去除[0-9]*条|流量剩余|更新订阅|官网|公告"
+SUBSCRIPTION_METADATA_RE = re.compile(SUBSCRIPTION_EXCLUDE_FILTER, re.IGNORECASE)
 
 
 class ProxyPoolError(RuntimeError):
@@ -77,6 +79,10 @@ def health_target(config: dict[str, Any], purpose: str = "register") -> str:
 
 def _clean_name(value: Any, fallback: str) -> str:
     return str(value or "").strip() or fallback
+
+
+def _subscription_node_is_metadata(name: str) -> bool:
+    return bool(SUBSCRIPTION_METADATA_RE.search(str(name or "")))
 
 
 def normalize_subscriptions(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -364,6 +370,8 @@ profile:
                     f"    url: {_yaml_string(item['url'])}",
                     f"    interval: {refresh}",
                     f"    path: {_yaml_string(f'./providers/{provider}.yaml')}",
+                    "    proxy: DIRECT",
+                    f"    exclude-filter: {_yaml_string(SUBSCRIPTION_EXCLUDE_FILTER)}",
                     "    override:",
                     f"      additional-prefix: {_yaml_string(prefix)}",
                     "    health-check:",
@@ -534,7 +542,8 @@ class MihomoRuntime:
         for item in normalize_subscriptions(config):
             if not item["enabled"] or not item["url"]:
                 continue
-            provider = urllib.parse.quote(_provider_name(item), safe="")
+            provider_name = _provider_name(item)
+            provider = urllib.parse.quote(provider_name, safe="")
             data = _json_request(_controller_base(config) + f"/providers/proxies/{provider}", timeout=8)
             for node in data.get("proxies") or []:
                 if not isinstance(node, dict) or not node.get("name"):
@@ -542,6 +551,8 @@ class MihomoRuntime:
                 full_name = str(node["name"])
                 prefix = f"[{item['name']}] "
                 display_name = full_name[len(prefix):] if full_name.startswith(prefix) else full_name
+                if _subscription_node_is_metadata(display_name):
+                    continue
                 history = node.get("history") if isinstance(node.get("history"), list) else []
                 delay = int((history[-1] or {}).get("delay") or 0) if history else 0
                 result.append(
@@ -551,6 +562,7 @@ class MihomoRuntime:
                         "full_name": full_name,
                         "group": item["name"],
                         "group_id": item["id"],
+                        "provider": provider_name,
                         "type": str(node.get("type") or "Proxy"),
                         "alive": node.get("alive") is True,
                         "delay": delay,
@@ -616,11 +628,19 @@ class MihomoRuntime:
             raise ProxyPoolError("节点不存在或所属分组未启用")
         target = str(target or health_target(config)).strip()
         timeout_ms = max(1000, int(float(config.get("proxy_pool_test_timeout_sec", 8) or 8) * 1000))
-        encoded = urllib.parse.quote(name, safe="")
         query = urllib.parse.urlencode({"url": target, "timeout": timeout_ms})
         started = time.monotonic()
         try:
-            data = _json_request(_controller_base(config) + f"/proxies/{encoded}/delay?{query}", timeout=(timeout_ms / 1000) + 4)
+            if proxy_mode(config) == "clash_subscription":
+                provider = urllib.parse.quote(str(available[name].get("provider") or ""), safe="")
+                encoded = urllib.parse.quote(name, safe="")
+                if not provider:
+                    raise ProxyPoolError("订阅节点缺少 Provider 信息")
+                endpoint = f"/providers/proxies/{provider}/{encoded}/healthcheck"
+            else:
+                encoded = urllib.parse.quote(name, safe="")
+                endpoint = f"/proxies/{encoded}/delay"
+            data = _json_request(_controller_base(config) + f"{endpoint}?{query}", timeout=(timeout_ms / 1000) + 4)
             delay = int(data.get("delay") or 0)
             if delay <= 0:
                 raise ProxyPoolError("未返回有效延迟")
@@ -696,8 +716,11 @@ class MihomoRuntime:
                 result = self.select_node(config, selected, target=target, test=True)
                 log(f"[PX-211] 手动节点可用 name={result.get('display_name') or selected} delay={result.get('delay')}ms")
                 return result
-            names = [item["full_name"] for item in nodes]
-            random.SystemRandom().shuffle(names)
+            healthy_names = [item["full_name"] for item in nodes if item.get("alive") is True]
+            other_names = [item["full_name"] for item in nodes if item.get("alive") is not True]
+            random.SystemRandom().shuffle(healthy_names)
+            random.SystemRandom().shuffle(other_names)
+            names = healthy_names + other_names
             attempts = max(1, min(len(names), int(config.get("proxy_pool_max_test_nodes", 12) or 12)))
             for index, name in enumerate(names[:attempts], 1):
                 try:

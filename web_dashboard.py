@@ -19,7 +19,9 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 import webbrowser
 import zipfile
 from collections import deque
@@ -28,9 +30,18 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import proxy_pool
+from cpa_xai.model_capabilities import (
+    delete_model_capability,
+    read_model_capability,
+    record_model_list,
+    record_model_test,
+)
+from cpa_xai.probe import probe_mini_response, probe_models
+from cpa_xai.refresh import refresh_cpa_auth
+from cpa_xai.schema import DEFAULT_BASE_URL
 
 
 ROOT = Path(__file__).resolve().parent
@@ -44,9 +55,15 @@ EMAILS_ERROR_PATH = ROOT / "emails_error.txt"
 CPA_DIR = ROOT / "cpa_auths"
 CPA_FAIL_PATH = CPA_DIR / "cpa_auth_failed.txt"
 BACKFILL_FAIL_PATH = CPA_DIR / "backfill_failed.jsonl"
+CPA_MANAGEMENT_URL = "http://127.0.0.1:8317"
+CPA_PUSH_STATUS_FILE = ".cpa_push_status.json"
 
 FILE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 12 * 1024 * 1024
+
+
+class FullCredentialRefreshRequired(ValueError):
+    """The refresh token failed and the account needs a full OIDC mint."""
 
 
 def now_iso() -> str:
@@ -84,6 +101,224 @@ def current_cpa_dir() -> Path:
     return configured_path("cpa_auth_dir", CPA_DIR)
 
 
+def cpa_management_base_url() -> str:
+    config = load_json_object(CONFIG_PATH)
+    url = str(
+        config.get("cpa_management_url")
+        or os.environ.get("CPA_MANAGEMENT_URL")
+        or CPA_MANAGEMENT_URL
+    ).strip()
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("CPA 管理地址无效，请配置完整的 http/https 地址")
+    if parsed.username or parsed.password:
+        raise ValueError("CPA 管理地址不能包含账户或密码")
+    return url.rstrip("/")
+
+
+def cpa_management_settings() -> tuple[str, str]:
+    config = load_json_object(CONFIG_PATH)
+    url = cpa_management_base_url()
+    key = str(
+        os.environ.get("CPA_MANAGEMENT_KEY")
+        or config.get("cpa_management_key")
+        or ""
+    ).strip()
+    if not key:
+        raise ValueError("CPA 管理密钥未配置")
+    return url, key
+
+
+def cpa_auth_files_endpoint(base_url: str) -> str:
+    suffix = "/v0/management"
+    return base_url + "/auth-files" if base_url.endswith(suffix) else base_url + suffix + "/auth-files"
+
+
+def cpa_management_error(exc: Exception) -> str:
+    if isinstance(exc, urllib.error.HTTPError):
+        try:
+            payload = json.loads(exc.read(16 * 1024).decode("utf-8", errors="replace"))
+            message = str(payload.get("error") or "").strip() if isinstance(payload, dict) else ""
+        except Exception:
+            message = ""
+        return f"HTTP {exc.code}{f'：{message}' if message else ''}"
+    if isinstance(exc, urllib.error.URLError):
+        return f"连接失败：{exc.reason}"
+    return str(exc)
+
+
+def cpa_push_status_path(auth_dir: Path | None = None) -> Path:
+    return (auth_dir or current_cpa_dir()).resolve() / CPA_PUSH_STATUS_FILE
+
+
+def read_cpa_push_status(auth_dir: Path | None = None) -> dict[str, Any]:
+    path = cpa_push_status_path(auth_dir)
+    try:
+        payload = json.loads(read_text(path))
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    files = payload.get("files")
+    return {"version": 1, "files": files if isinstance(files, dict) else {}}
+
+
+def write_cpa_push_status(auth_dir: Path, payload: dict[str, Any]) -> None:
+    with FILE_LOCK:
+        atomic_write(
+            cpa_push_status_path(auth_dir),
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+
+
+def cpa_file_push_state(
+    path: Path,
+    *,
+    registry: dict[str, Any] | None = None,
+    target: str | None = None,
+) -> dict[str, Any]:
+    registry = registry or read_cpa_push_status(path.parent)
+    item = (registry.get("files") or {}).get(path.name)
+    if not isinstance(item, dict) or not path.is_file():
+        return {"pushed": False, "pushed_at": "", "target": ""}
+    try:
+        fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return {"pushed": False, "pushed_at": "", "target": ""}
+    current_target = (target or cpa_management_base_url()).rstrip("/")
+    pushed = (
+        str(item.get("sha256") or "") == fingerprint
+        and str(item.get("target") or "").rstrip("/") == current_target
+    )
+    return {
+        "pushed": pushed,
+        "pushed_at": str(item.get("pushed_at") or "") if pushed else "",
+        "target": urllib.parse.urlparse(current_target).netloc if pushed else "",
+    }
+
+
+def delete_cpa_push_status(auth_dir: Path, filenames: set[str]) -> int:
+    if not filenames:
+        return 0
+    payload = read_cpa_push_status(auth_dir)
+    files = payload["files"]
+    lowered = {name.lower() for name in filenames}
+    removed = 0
+    for name in list(files):
+        if name.lower() in lowered:
+            files.pop(name, None)
+            removed += 1
+    if removed:
+        write_cpa_push_status(auth_dir, payload)
+    return removed
+
+
+def push_cpa_auths_to_management(
+    *,
+    auth_dir: Path | None = None,
+    management_url: str | None = None,
+    management_key: str | None = None,
+    emails: list[str] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    if management_url is None or management_key is None:
+        configured_url, configured_key = cpa_management_settings()
+        management_url = management_url or configured_url
+        management_key = management_key or configured_key
+    base_url = str(management_url).rstrip("/")
+    endpoint = cpa_auth_files_endpoint(base_url)
+    source_dir = (auth_dir or current_cpa_dir()).resolve()
+    if emails:
+        wanted = {str(email).strip().lower() for email in emails if str(email).strip()}
+        paths = []
+        for email in sorted(wanted):
+            path = find_cpa_path_in_dir(source_dir, email)
+            if path and path.resolve().parent == source_dir:
+                paths.append(path.resolve())
+        paths = sorted(set(paths))
+    else:
+        paths = sorted(source_dir.glob("xai-*.json")) if source_dir.is_dir() else []
+    if not paths:
+        raise ValueError("当前没有可推送的 CPA 凭证")
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "grok-account-studio/1.0",
+        "X-Management-Key": str(management_key),
+    }
+    registry = read_cpa_push_status(source_dir)
+    pushed: list[str] = []
+    fingerprints: dict[str, str] = {}
+    skipped: list[str] = []
+    failed: list[dict[str, str]] = []
+    for path in paths:
+        try:
+            data = path.read_bytes()
+            payload = json.loads(data.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("凭证 JSON 必须是对象")
+            fingerprint = hashlib.sha256(data).hexdigest()
+            previous = (registry.get("files") or {}).get(path.name)
+            already_pushed = isinstance(previous, dict) and (
+                str(previous.get("sha256") or "") == fingerprint
+                and str(previous.get("target") or "").rstrip("/") == base_url
+            )
+            if already_pushed and not force:
+                skipped.append(path.name)
+                continue
+            upload_url = endpoint + "?" + urllib.parse.urlencode({"name": path.name})
+            request = urllib.request.Request(upload_url, data=data, headers=headers, method="POST")
+            with opener.open(request, timeout=20) as response:
+                response_data = json.loads(response.read(64 * 1024).decode("utf-8", errors="replace") or "{}")
+                if response.status != HTTPStatus.OK or response_data.get("status") != "ok":
+                    raise ValueError(f"CPA 返回异常状态：HTTP {response.status}")
+            pushed.append(path.name)
+            fingerprints[path.name] = fingerprint
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"name": path.name, "error": cpa_management_error(exc)})
+
+    recognized = 0
+    if pushed:
+        try:
+            request = urllib.request.Request(endpoint, headers=headers, method="GET")
+            with opener.open(request, timeout=20) as response:
+                payload = json.loads(response.read(1024 * 1024).decode("utf-8", errors="replace") or "{}")
+            remote_names = {
+                str(item.get("name") or "")
+                for item in payload.get("files", [])
+                if isinstance(item, dict)
+            }
+            for name in pushed:
+                if name not in remote_names:
+                    failed.append({"name": name, "error": "CPA 未在热加载列表中识别该凭证"})
+                    continue
+                recognized += 1
+                registry["files"][name] = {
+                    "sha256": fingerprints[name],
+                    "pushed_at": now_iso(),
+                    "target": base_url,
+                }
+            if recognized:
+                write_cpa_push_status(source_dir, registry)
+        except Exception as exc:  # noqa: BLE001
+            failed.append({"name": "热加载校验", "error": cpa_management_error(exc)})
+
+    target = urllib.parse.urlparse(base_url)
+    return {
+        "ok": not failed and recognized == len(pushed),
+        "total": len(paths),
+        "pending": len(paths) - len(skipped),
+        "pushed": len(pushed),
+        "recognized": recognized,
+        "skipped": len(skipped),
+        "failed": len(failed),
+        "failures": failed,
+        "target": target.netloc,
+    }
+
+
 def atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".webtmp")
@@ -111,7 +346,39 @@ def mask_email(email: str) -> str:
     return f"{mask(local, left=2, right=1)}@{domain}"
 
 
-def public_account(record: dict[str, Any]) -> dict[str, Any]:
+def model_test_reason(item: dict[str, Any]) -> str:
+    if item.get("ok"):
+        return "available"
+    status = int(item.get("status") or 0)
+    error = str(item.get("error") or "").lower()
+    if status == 403 and (
+        "permission-denied" in error or "access to the chat endpoint is denied" in error
+    ):
+        return "permission_denied"
+    if status == 429:
+        return "quota_limited"
+    if status == 401 or "invalid or expired credentials" in error or "no auth context" in error:
+        return "credential_invalid"
+    return "unavailable"
+
+
+def public_account(
+    record: dict[str, Any],
+    push_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    cpa_path = Path(record["cpa_path"]) if record.get("cpa_path") else None
+    push_state = (
+        cpa_file_push_state(cpa_path, registry=push_registry)
+        if cpa_path
+        else {"pushed": False, "pushed_at": "", "target": ""}
+    )
+    capability = (
+        read_model_capability(current_cpa_dir(), record["email"])
+        if record.get("cpa_path")
+        else {}
+    )
+    raw_tests = capability.get("tests")
+    tests = raw_tests if isinstance(raw_tests, dict) else {}
     return {
         "id": stable_id(record["email"]),
         "email": record["email"],
@@ -120,8 +387,27 @@ def public_account(record: dict[str, Any]) -> dict[str, Any]:
         "has_sso": bool(record.get("sso")),
         "has_cpa": bool(record.get("cpa_path")),
         "cpa_file": Path(record["cpa_path"]).name if record.get("cpa_path") else "",
+        "cpa_pushed": bool(push_state.get("pushed")),
+        "cpa_pushed_at": str(push_state.get("pushed_at") or ""),
+        "cpa_push_target": str(push_state.get("target") or ""),
         "source": record.get("source", ""),
         "updated_at": record.get("updated_at", ""),
+        "models": capability.get("models") if isinstance(capability.get("models"), list) else [],
+        "models_ok": bool(capability.get("models_ok")),
+        "models_status": int(capability.get("models_status") or 0),
+        "models_error": str(capability.get("models_error") or ""),
+        "models_checked_at": str(capability.get("checked_at") or ""),
+        "model_tests": {
+            str(model): {
+                "ok": bool(item.get("ok")),
+                "status": int(item.get("status") or 0),
+                "reason": model_test_reason(item),
+                "rate_limits": item.get("rate_limits") if isinstance(item.get("rate_limits"), dict) else {},
+                "tested_at": str(item.get("tested_at") or ""),
+            }
+            for model, item in tests.items()
+            if isinstance(item, dict)
+        },
     }
 
 
@@ -250,8 +536,7 @@ def account_files() -> list[Path]:
     return files
 
 
-def find_cpa_path(email: str) -> Path | None:
-    auth_dir = current_cpa_dir()
+def find_cpa_path_in_dir(auth_dir: Path, email: str) -> Path | None:
     direct = auth_dir / f"xai-{email}.json"
     if direct.is_file():
         return direct
@@ -266,6 +551,324 @@ def find_cpa_path(email: str) -> Path | None:
         except Exception:
             continue
     return None
+
+
+def find_cpa_path(email: str) -> Path | None:
+    return find_cpa_path_in_dir(current_cpa_dir(), email)
+
+
+def remove_success_accounts(emails: list[str]) -> dict[str, Any]:
+    wanted = {str(email).strip().lower() for email in emails if str(email).strip()}
+    if not wanted:
+        raise ValueError("请选择要删除的账户")
+
+    auth_dirs = [current_cpa_dir().resolve()]
+    config = load_json_object(CONFIG_PATH)
+    hotload_value = str(config.get("cpa_hotload_dir") or "").strip()
+    if hotload_value:
+        hotload = Path(hotload_value).expanduser()
+        hotload = hotload.resolve() if hotload.is_absolute() else (ROOT / hotload).resolve()
+        if hotload not in auth_dirs:
+            auth_dirs.append(hotload)
+
+    auth_paths: set[Path] = set()
+    for email in wanted:
+        for auth_dir in auth_dirs:
+            path = find_cpa_path_in_dir(auth_dir, email)
+            if path:
+                resolved = path.resolve()
+                if resolved.parent == auth_dir:
+                    auth_paths.add(resolved)
+
+    mailbox_records, _ = parse_mail_text(read_text(current_mail_path()))
+    mailbox_emails = {
+        record["email"].lower()
+        for record in mailbox_records
+        if any(is_alias_of(account_email, record["email"]) for account_email in wanted)
+    }
+
+    files = account_files()
+    with FILE_LOCK:
+        account_rows = sum(filter_delimited_file(path, wanted) for path in files)
+        mailbox_rows = remove_mailboxes(list(mailbox_emails))
+        failure_rows = clear_failures(list(wanted))
+        cpa_files = 0
+        for path in auth_paths:
+            try:
+                path.unlink()
+                cpa_files += 1
+            except FileNotFoundError:
+                pass
+        model_caches = sum(
+            1 for email in wanted if delete_model_capability(auth_dirs[0], email)
+        )
+        push_markers = delete_cpa_push_status(
+            auth_dirs[0],
+            {path.name for path in auth_paths if path.parent == auth_dirs[0]},
+        )
+
+    return {
+        "ok": True,
+        "requested": len(wanted),
+        "account_rows": account_rows,
+        "mailbox_rows": mailbox_rows,
+        "failure_rows": failure_rows,
+        "cpa_files": cpa_files,
+        "model_caches": model_caches,
+        "push_markers": push_markers,
+        "used_markers_retained": True,
+    }
+
+
+def load_cpa_auth(email: str) -> tuple[Path, dict[str, Any]]:
+    path = find_cpa_path(email)
+    if not path:
+        raise ValueError("该账户还没有 CPA 凭证，请先获取 CPA")
+    try:
+        data = json.loads(read_text(path))
+    except json.JSONDecodeError as exc:
+        raise ValueError("CPA 凭证文件不是有效 JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("CPA 凭证内容无效")
+    if not str(data.get("access_token") or "").strip():
+        raise ValueError("CPA 凭证缺少 access_token")
+    return path, data
+
+
+def cpa_probe_proxy(target: str = "") -> str:
+    config = load_json_object(CONFIG_PATH)
+    if not proxy_pool.proxy_is_enabled(config, purpose="cpa"):
+        raise ValueError("模型与额度接口必须走代理，请先在“代理网络”中开启代理")
+    selected = proxy_pool.prepare_proxy(config, purpose="cpa", target=target or None)
+    proxy = str(selected.get("proxy") or proxy_pool.effective_proxy(config, purpose="cpa")).strip()
+    if not proxy:
+        raise ValueError("代理已开启但未获得可用代理地址")
+    return proxy
+
+
+def run_cpa_probe(
+    target: str,
+    callback: Callable[[str], dict[str, Any]],
+    *,
+    attempts: int = 3,
+) -> dict[str, Any]:
+    last: dict[str, Any] = {}
+    for attempt in range(1, max(1, attempts) + 1):
+        proxy = cpa_probe_proxy(target)
+        last = callback(proxy)
+        last["attempts"] = attempt
+        status = int(last.get("status") or 0)
+        if invalid_cpa_auth_result(last) or model_test_reason(last) == "permission_denied":
+            return last
+        if last.get("ok") or status not in {0, 403, 408, 502, 503, 504}:
+            return last
+    return last
+
+
+def invalid_cpa_auth_result(result: dict[str, Any]) -> bool:
+    if result.get("ok"):
+        return False
+    status = int(result.get("status") or 0)
+    error = str(result.get("error") or "").lower()
+    markers = (
+        "invalid or expired credentials",
+        "no auth context",
+        "permissiondenied",
+        "invalid_token",
+    )
+    return status == 401 or any(marker in error for marker in markers)
+
+
+def auto_refresh_cpa_auth(
+    auth_path: Path,
+    auth: dict[str, Any],
+    failed_result: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
+    if not invalid_cpa_auth_result(failed_result):
+        return auth, False
+    base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    try:
+        proxy = cpa_probe_proxy(f"{base_url}/models")
+        refresh_cpa_auth(auth_path, proxy=proxy, probe=True, timeout=60.0)
+        refreshed = json.loads(read_text(auth_path))
+        if not isinstance(refreshed, dict):
+            raise ValueError("刷新后的 CPA 凭证内容无效")
+        return refreshed, True
+    except Exception as exc:
+        raise FullCredentialRefreshRequired(
+            f"凭证已失效且自动刷新失败，请点击“刷新凭证”执行完整重取: {exc}"
+        ) from exc
+
+
+def refresh_account_models(email: str) -> dict[str, Any]:
+    email = email.strip().lower()
+    if not email:
+        raise ValueError("缺少账户邮箱")
+    auth_path, auth = load_cpa_auth(email)
+    base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    result = run_cpa_probe(
+        f"{base_url}/models",
+        lambda proxy: probe_models(
+            str(auth.get("access_token") or ""),
+            base_url=base_url,
+            proxy=proxy,
+        ),
+    )
+    auth, credential_refreshed = auto_refresh_cpa_auth(auth_path, auth, result)
+    if credential_refreshed:
+        base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+        result = run_cpa_probe(
+            f"{base_url}/models",
+            lambda proxy: probe_models(
+                str(auth.get("access_token") or ""),
+                base_url=base_url,
+                proxy=proxy,
+            ),
+        )
+    cached = record_model_list(current_cpa_dir(), email, result)
+    return {
+        "ok": bool(result.get("ok")),
+        "email": email,
+        "status": int(result.get("status") or 0),
+        "models": cached.get("models") or [],
+        "checked_at": cached.get("checked_at") or "",
+        "attempts": int(result.get("attempts") or 1),
+        "credential_refreshed": credential_refreshed,
+        "error": str(result.get("error") or ""),
+    }
+
+
+def test_account_model(email: str, model: str) -> dict[str, Any]:
+    email = email.strip().lower()
+    model = model.strip()
+    if not email:
+        raise ValueError("缺少账户邮箱")
+    if not model or len(model) > 120 or not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
+        raise ValueError("模型名称格式无效")
+    auth_path, auth = load_cpa_auth(email)
+    base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    result = run_cpa_probe(
+        f"{base_url}/responses",
+        lambda proxy: probe_mini_response(
+            str(auth.get("access_token") or ""),
+            model=model,
+            base_url=base_url,
+            proxy=proxy,
+        ),
+    )
+    auth, credential_refreshed = auto_refresh_cpa_auth(auth_path, auth, result)
+    if credential_refreshed:
+        base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+        result = run_cpa_probe(
+            f"{base_url}/responses",
+            lambda proxy: probe_mini_response(
+                str(auth.get("access_token") or ""),
+                model=model,
+                base_url=base_url,
+                proxy=proxy,
+            ),
+        )
+    cached = record_model_test(current_cpa_dir(), email, model, result)
+    tested = (cached.get("tests") or {}).get(model) or {}
+    return {
+        "ok": bool(result.get("ok")),
+        "email": email,
+        "model": model,
+        "status": int(result.get("status") or 0),
+        "tested_at": str(tested.get("tested_at") or ""),
+        "attempts": int(result.get("attempts") or 1),
+        "credential_refreshed": credential_refreshed,
+        "reason": model_test_reason(result),
+        "text": str(result.get("text") or "")[:200],
+        "rate_limits": result.get("rate_limits") or {},
+        "error": str(result.get("error") or "")[:500],
+    }
+
+
+def refresh_account_quota(email: str) -> dict[str, Any]:
+    email = email.strip().lower()
+    if not email:
+        raise ValueError("缺少账户邮箱")
+    auth_path, auth = load_cpa_auth(email)
+    base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+    credential_refreshed = False
+    capability = read_model_capability(current_cpa_dir(), email)
+    models = [str(item).strip() for item in (capability.get("models") or []) if str(item).strip()]
+    if not models:
+        discovered = run_cpa_probe(
+            f"{base_url}/models",
+            lambda proxy: probe_models(
+                str(auth.get("access_token") or ""),
+                base_url=base_url,
+                proxy=proxy,
+            ),
+        )
+        auth, credential_refreshed = auto_refresh_cpa_auth(auth_path, auth, discovered)
+        if credential_refreshed:
+            base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+            discovered = run_cpa_probe(
+                f"{base_url}/models",
+                lambda proxy: probe_models(
+                    str(auth.get("access_token") or ""),
+                    base_url=base_url,
+                    proxy=proxy,
+                ),
+            )
+        capability = record_model_list(current_cpa_dir(), email, discovered)
+        if not discovered.get("ok"):
+            return {
+                "ok": False,
+                "email": email,
+                "models": [],
+                "results": [],
+                "error": str(discovered.get("error") or f"HTTP {discovered.get('status') or 0}"),
+            }
+        models = [str(item).strip() for item in (capability.get("models") or []) if str(item).strip()]
+    results: list[dict[str, Any]] = []
+    for model in models:
+        tested = run_cpa_probe(
+            f"{base_url}/responses",
+            lambda proxy, model=model: probe_mini_response(
+                str(auth.get("access_token") or ""),
+                model=model,
+                base_url=base_url,
+                proxy=proxy,
+            ),
+        )
+        if not credential_refreshed:
+            auth, refreshed_now = auto_refresh_cpa_auth(auth_path, auth, tested)
+            if refreshed_now:
+                credential_refreshed = True
+                base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+                tested = run_cpa_probe(
+                    f"{base_url}/responses",
+                    lambda proxy, model=model: probe_mini_response(
+                        str(auth.get("access_token") or ""),
+                        model=model,
+                        base_url=base_url,
+                        proxy=proxy,
+                    ),
+                )
+        record_model_test(current_cpa_dir(), email, model, tested)
+        results.append(
+            {
+                "model": model,
+                "ok": bool(tested.get("ok")),
+                "status": int(tested.get("status") or 0),
+                "attempts": int(tested.get("attempts") or 1),
+                "reason": model_test_reason(tested),
+                "rate_limits": tested.get("rate_limits") or {},
+                "error": str(tested.get("error") or "")[:500],
+            }
+        )
+    return {
+        "ok": bool(results) and all(item["ok"] for item in results),
+        "email": email,
+        "models": models,
+        "results": results,
+        "credential_refreshed": credential_refreshed,
+        "error": "" if results else "该账户没有可测试的模型",
+    }
 
 
 def discover_accounts() -> list[dict[str, Any]]:
@@ -466,6 +1069,8 @@ def friendly_label(key: str) -> str:
         "register_threads": "注册并发数",
         "cpa_export_enabled": "注册后生成 CPA 凭证",
         "cpa_auth_dir": "CPA 凭证目录",
+        "cpa_management_url": "CPA 管理地址",
+        "cpa_management_key": "CPA 管理密钥",
         "cpa_proxy": "CPA 专用代理",
         "cpa_prefer_protocol": "优先使用协议模式",
         "cpa_protocol_only": "仅使用协议模式",
@@ -771,6 +1376,10 @@ class TaskManager:
             ]
             if bool(options.get("probe", True)):
                 command.append("--probe")
+            if bool(options.get("refresh_existing", False)):
+                command.append("--refresh-existing")
+            elif bool(options.get("force", False)):
+                command.append("--no-skip-existing")
             email = str(options.get("email") or "").strip()
             if email:
                 command.extend(("--email", email))
@@ -996,7 +1605,8 @@ h1{{margin:20px 0 7px;font-size:24px;letter-spacing:-.6px}}p{{margin:0 0 24px;co
                 records, invalid = parse_mail_text(read_text(mail_path))
                 return self.json_response({"items": list_mailboxes(), "invalid_count": len(invalid), "total": len(records), "path": str(mail_path)})
             if path == "/api/accounts":
-                items = [public_account(item) for item in discover_accounts()]
+                push_registry = read_cpa_push_status()
+                items = [public_account(item, push_registry) for item in discover_accounts()]
                 return self.json_response({"items": items, "total": len(items)})
             if path == "/api/account/credential":
                 email = str((query.get("email") or [""])[0]).strip().lower()
@@ -1040,9 +1650,29 @@ h1{{margin:20px 0 7px;font-size:24px;letter-spacing:-.6px}}p{{margin:0 0 24px;co
             if path == "/api/mailboxes/delete":
                 removed = remove_mailboxes(list(body.get("emails") or []))
                 return self.json_response({"ok": True, "removed": removed})
+            if path == "/api/accounts/delete":
+                return self.json_response(remove_success_accounts(list(body.get("emails") or [])))
+            if path == "/api/cpa/push":
+                return self.json_response(
+                    push_cpa_auths_to_management(
+                        emails=list(body.get("emails") or []),
+                        force=bool(body.get("force", False)),
+                    )
+                )
             if path == "/api/failures/retry":
                 removed = clear_failures(list(body.get("emails") or []))
                 return self.json_response({"ok": True, "removed": removed})
+            if path == "/api/account/models/refresh":
+                return self.json_response(refresh_account_models(str(body.get("email") or "")))
+            if path == "/api/account/model/test":
+                return self.json_response(
+                    test_account_model(
+                        str(body.get("email") or ""),
+                        str(body.get("model") or ""),
+                    )
+                )
+            if path == "/api/account/quota/refresh":
+                return self.json_response(refresh_account_quota(str(body.get("email") or "")))
             if path == "/api/config":
                 result = save_config(body.get("values") or {})
                 cfg = load_json_object(CONFIG_PATH)
@@ -1098,6 +1728,15 @@ h1{{margin:20px 0 7px;font-size:24px;letter-spacing:-.6px}}p{{margin:0 0 24px;co
             if path == "/api/task/stop":
                 return self.json_response(TASKS.stop())
             return self.error_response("接口不存在", 404)
+        except FullCredentialRefreshRequired as exc:
+            return self.json_response(
+                {
+                    "ok": False,
+                    "code": "credential_refresh_required",
+                    "error": str(exc),
+                },
+                409,
+            )
         except (ValueError, RuntimeError, json.JSONDecodeError) as exc:
             return self.error_response(str(exc), 400)
         except Exception as exc:  # noqa: BLE001

@@ -178,6 +178,50 @@ class OAuthDeviceError(RuntimeError):
     pass
 
 
+def refresh_access_token(
+    refresh_token: str,
+    *,
+    token_endpoint: str = TOKEN_URL,
+    client_id: str = CLIENT_ID,
+    timeout: float = 30.0,
+    proxy: str | None = None,
+) -> TokenResult:
+    """Refresh an xAI OAuth access token through the configured proxy."""
+    refresh_token = str(refresh_token or "").strip()
+    token_endpoint = str(token_endpoint or TOKEN_URL).strip()
+    if not refresh_token:
+        raise OAuthDeviceError("refresh token is missing")
+    parsed = urllib.parse.urlparse(token_endpoint)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or (host != "x.ai" and not host.endswith(".x.ai")):
+        raise OAuthDeviceError("token endpoint must use HTTPS on x.ai")
+    status, body = _post_form(
+        token_endpoint,
+        {
+            "grant_type": "refresh_token",
+            "client_id": client_id,
+            "refresh_token": refresh_token,
+        },
+        timeout=timeout,
+        proxy=proxy,
+        retries=2,
+        retry_sleep=1.0,
+    )
+    if status != 200 or not isinstance(body, dict) or not body.get("access_token"):
+        error = str(body.get("error") or "unknown_error") if isinstance(body, dict) else "invalid_response"
+        description = str(body.get("error_description") or "") if isinstance(body, dict) else ""
+        detail = f": {description}" if description else ""
+        raise OAuthDeviceError(f"token refresh failed HTTP {status}: {error}{detail}")
+    return TokenResult(
+        access_token=str(body.get("access_token") or "").strip(),
+        refresh_token=str(body.get("refresh_token") or refresh_token).strip(),
+        id_token=(str(body.get("id_token") or "").strip() or None),
+        token_type=str(body.get("token_type") or "Bearer"),
+        expires_in=int(body.get("expires_in") or 21600),
+        raw=body,
+    )
+
+
 def request_device_code(
     *,
     client_id: str = CLIENT_ID,

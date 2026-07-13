@@ -524,6 +524,7 @@ def main() -> int:
     parser.add_argument("--inline-mint", action="store_true", help="强制注册线程内联 mint（调试用）")
     args = parser.parse_args()
 
+    reg._SUCCESS_ACCOUNTS_FILE = os.path.abspath(args.accounts_file)
     reg.load_config()
     cfg0 = getattr(reg, "config", {}) or {}
     threads = max(1, min(args.threads, 10))

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .browser_confirm import mint_with_browser
+from .model_capabilities import record_model_list
 from .probe import probe_mini_response, probe_models
 from .protocol_mint import ProtocolMintError, extract_sso_from_cookies, mint_with_sso_protocol
 from .proxyutil import proxy_log_label, resolve_proxy, set_runtime_proxy
@@ -179,11 +180,25 @@ def mint_and_export(
     if probe:
         pr = probe_models(tokens["access_token"], base_url=base_url, proxy=resolved or None)
         result["probe_models"] = pr
-        log(
-            f"probe models: ok={pr.get('ok')} status={pr.get('status')} "
-            f"has_grok_45={pr.get('has_grok_45')} ids={pr.get('model_ids')} "
-            f"error={str(pr.get('error') or '')[:200]}"
-        )
+        record_model_list(auth_dir, email, pr)
+        probe_status = pr.get("status")
+        probe_models_list = pr.get("model_ids") or []
+        if pr.get("ok") and pr.get("has_grok_45"):
+            log(
+                f"[CPA-PROBE-200] 凭证验证成功: HTTP {probe_status}，"
+                f"支持 grok-4.5，可用模型={probe_models_list}"
+            )
+        elif pr.get("ok"):
+            log(
+                f"[CPA-PROBE-404] 凭证可访问模型接口，但不支持 grok-4.5: "
+                f"HTTP {probe_status}，可用模型={probe_models_list}"
+            )
+        else:
+            probe_error = str(pr.get("error") or "未知错误")[:200]
+            log(
+                f"[CPA-PROBE-500] 凭证验证失败: HTTP {probe_status}，"
+                f"原因={probe_error}"
+            )
         if not pr.get("has_grok_45"):
             result["ok"] = False
             result["error"] = "token ok but grok-4.5 not listed"

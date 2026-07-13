@@ -24,8 +24,31 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from cpa_xai import existing_cpa_emails, mint_and_export, parse_accounts_file  # noqa: E402
+from cpa_xai import (  # noqa: E402
+    credential_file_name,
+    existing_cpa_emails,
+    mint_and_export,
+    parse_accounts_file,
+    refresh_cpa_auth,
+    write_cpa_xai_auth,
+)
 import proxy_pool  # noqa: E402
+
+
+def find_auth_path(auth_dir: str | Path, email: str) -> Path | None:
+    root = Path(auth_dir)
+    direct = root / credential_file_name(email)
+    if direct.is_file():
+        return direct
+    target = email.strip().lower()
+    for path in root.glob("xai-*.json") if root.is_dir() else ():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if str(data.get("email") or "").strip().lower() == target:
+            return path
+    return None
 
 
 def main() -> int:
@@ -49,6 +72,11 @@ def main() -> int:
     ap.add_argument("--email", default="", help="Only this email")
     ap.add_argument("--skip-existing", action="store_true", default=True)
     ap.add_argument("--no-skip-existing", action="store_false", dest="skip_existing")
+    ap.add_argument(
+        "--refresh-existing",
+        action="store_true",
+        help="Refresh an existing credential first; fall back to full OIDC mint on failure",
+    )
     ap.add_argument(
         "--headless",
         action="store_true",
@@ -88,6 +116,9 @@ def main() -> int:
         help="Always open fresh Chromium (default)",
     )
     args = ap.parse_args()
+
+    if args.refresh_existing:
+        args.skip_existing = False
 
     if args.headless:
         args.headed = False
@@ -159,21 +190,58 @@ def main() -> int:
             selected = proxy_pool.prepare_proxy(cfg, purpose="cpa", log=lambda msg: log(f"[proxy] {msg}"))
             args.proxy = str(selected.get("proxy") or proxy_pool.effective_proxy(cfg, purpose="cpa"))
 
-        r = mint_and_export(
-            email=acc.email,
-            password=acc.password,
-            auth_dir=args.out_dir,
-            page=None,
-            proxy=args.proxy or None,
-            headless=args.headless,
-            probe=args.probe,
-            probe_chat=args.probe_chat,
-            browser_timeout_sec=args.timeout,
-            force_standalone=args.force_standalone,
-            sso=acc.sso or None,
-            prefer_protocol=True,
-            log=log,
-        )
+        r = None
+        existing_path = None
+        previous_payload = None
+        if args.refresh_existing:
+            existing_path = find_auth_path(args.out_dir, acc.email)
+            if existing_path:
+                try:
+                    previous_payload = json.loads(existing_path.read_text(encoding="utf-8"))
+                except Exception:
+                    previous_payload = None
+                try:
+                    log("[CPA-REFRESH-100] 发现已有凭证，优先执行 refresh_token 刷新")
+                    r = refresh_cpa_auth(
+                        existing_path,
+                        proxy=args.proxy,
+                        probe=args.probe,
+                        timeout=min(args.timeout, 90.0),
+                        log=log,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log(f"[CPA-REFRESH-120] refresh_token 刷新失败，转入完整 OIDC 重取: {exc}")
+            else:
+                log("[CPA-REFRESH-110] 未找到旧凭证，直接执行完整 OIDC 获取")
+
+        if r is None:
+            r = mint_and_export(
+                email=acc.email,
+                password=acc.password,
+                auth_dir=args.out_dir,
+                page=None,
+                proxy=args.proxy or None,
+                headless=args.headless,
+                probe=args.probe,
+                probe_chat=args.probe_chat,
+                browser_timeout_sec=args.timeout,
+                force_standalone=args.force_standalone,
+                sso=acc.sso or None,
+                prefer_protocol=True,
+                log=log,
+            )
+            if (
+                args.refresh_existing
+                and not r.get("ok")
+                and existing_path is not None
+                and isinstance(previous_payload, dict)
+            ):
+                write_cpa_xai_auth(
+                    existing_path.parent,
+                    previous_payload,
+                    filename=existing_path.name,
+                )
+                log("[CPA-REFRESH-130] 新凭证验证失败，已恢复旧凭证文件")
         results.append(r)
         if r.get("ok") and r.get("path"):
             ok_n += 1

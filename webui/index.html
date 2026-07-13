@@ -114,13 +114,15 @@
             <div><strong>成功账户与凭证</strong><span id="accountCount">0 个账户</span></div>
             <div class="toolbar-actions">
               <div class="search-box"><span>⌕</span><input id="accountSearch" placeholder="搜索账户"></div>
+              <button class="secondary-button" id="backfillMissingCpa" type="button">一键补全缺失 CPA</button>
               <a class="secondary-button as-link" href="/api/export/accounts">导出账户</a>
-              <a class="primary-button as-link" href="/api/export/cpa">打包 CPA</a>
+              <a class="secondary-button as-link" href="/api/export/cpa">打包 CPA</a>
+              <button class="primary-button" id="pushCpa" type="button">一键推送 CPA</button>
             </div>
           </div>
           <article class="panel table-panel">
             <div class="table-wrap">
-              <table><thead><tr><th>账户</th><th>密码</th><th>SSO</th><th>CPA</th><th>来源</th><th>操作</th></tr></thead><tbody id="accountRows"></tbody></table>
+              <table><thead><tr><th>账户</th><th>密码</th><th>SSO</th><th>CPA</th><th>可用模型</th><th>来源</th><th>操作</th></tr></thead><tbody id="accountRows"></tbody></table>
             </div>
             <div class="empty-state" id="accountEmpty"><span>✓</span><strong>还没有成功账户</strong><p>注册成功后会自动显示在这里。</p></div>
           </article>

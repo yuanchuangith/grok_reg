@@ -13,6 +13,8 @@ const state = {
   proxySubscriptions: [],
   proxyStaticProxies: [],
   proxyNodeTests: {},
+  modelActions: {},
+  cpaPushRunning: false,
   importText: "",
   taskSignature: "",
 };
@@ -45,7 +47,12 @@ async function api(path, options = {}) {
     ...options,
   });
   const data = await response.json().catch(() => ({error: `HTTP ${response.status}`}));
-  if (!response.ok) throw new Error(data.error || `请求失败：${response.status}`);
+  if (!response.ok) {
+    const error = new Error(data.error || `请求失败：${response.status}`);
+    error.code = data.code || "";
+    error.status = response.status;
+    throw error;
+  }
   return data;
 }
 
@@ -144,10 +151,49 @@ function renderAccounts() {
     <td><div class="email-cell"><span class="avatar">${escapeHtml(item.email.slice(0,1).toUpperCase())}</span><div><strong>${escapeHtml(item.email)}</strong><small>${escapeHtml(item.updated_at ? new Date(item.updated_at).toLocaleString() : "")}</small></div></div></td>
     <td class="mono">${escapeHtml(item.password_masked)}</td>
     <td><span class="badge ${item.has_sso ? "success" : "warning"}">${item.has_sso ? "✓ 已保留" : "! 缺失"}</span></td>
-    <td><span class="badge ${item.has_cpa ? "violet" : "neutral"}">${item.has_cpa ? "◆ " + escapeHtml(item.cpa_file) : "未生成"}</span></td>
-    <td>${escapeHtml(item.source)}</td><td><button class="table-action credential-button" data-email="${escapeHtml(item.email)}">查看凭证</button></td>
+    <td><div class="cpa-state"><span class="badge ${item.has_cpa ? "violet" : "neutral"}">${item.has_cpa ? "◆ " + escapeHtml(item.cpa_file) : "未生成"}</span>${item.has_cpa ? `<span class="badge ${item.cpa_pushed ? "success" : "warning"}" title="${item.cpa_pushed ? `已推送到 ${escapeHtml(item.cpa_push_target || "CPA")} · ${escapeHtml(item.cpa_pushed_at ? new Date(item.cpa_pushed_at).toLocaleString() : "")}` : "尚未推送，或凭证更新后需要重新推送"}">${item.cpa_pushed ? "✓ 已推送" : "! 待推送"}</span>` : ""}</div></td>
+    <td class="model-capability-cell">${renderAccountModels(item)}</td>
+    <td>${escapeHtml(item.source)}</td><td><div class="table-row-actions"><button class="table-action credential-button" data-email="${escapeHtml(item.email)}">查看凭证</button>${item.has_cpa ? `<button class="table-action cpa-push-button" data-email="${escapeHtml(item.email)}" ${state.cpaPushRunning ? "disabled" : ""}>${item.cpa_pushed ? "重新推送" : "推送 CPA"}</button><button class="table-action refresh-credential-button" data-email="${escapeHtml(item.email)}">刷新凭证</button><button class="table-action refresh-models-button" data-email="${escapeHtml(item.email)}">${item.models?.length ? "刷新模型" : "获取模型"}</button><button class="table-action refresh-quota-button" data-email="${escapeHtml(item.email)}">刷新额度状态</button>` : `<button class="table-action cpa-backfill-button" data-email="${escapeHtml(item.email)}">获取 CPA</button>`}<button class="table-action account-delete-button" data-email="${escapeHtml(item.email)}">删除账户</button></div></td>
   </tr>`).join("");
+  const missing = state.accounts.filter(item => !item.has_cpa).length;
+  const pendingCpaCount = state.accounts.filter(item => item.has_cpa && !item.cpa_pushed).length;
+  $("#backfillMissingCpa").textContent = missing ? `一键补全缺失 CPA (${missing})` : "CPA 已全部生成";
+  $("#backfillMissingCpa").disabled = missing === 0;
+  $("#pushCpa").textContent = state.cpaPushRunning ? "正在推送…" : pendingCpaCount ? `一键推送 CPA (${pendingCpaCount})` : "CPA 已全部推送";
+  $("#pushCpa").disabled = state.cpaPushRunning || pendingCpaCount === 0;
   $("#accountEmpty").classList.toggle("visible", items.length === 0);
+}
+
+function modelRateLimitText(test) {
+  if (test?.reason === "permission_denied") return "无聊天权限";
+  if (test?.reason === "credential_invalid") return "凭证失效";
+  if (test?.reason === "quota_limited") return "额度受限";
+  const limits = test?.rate_limits || {};
+  const remaining = limits["x-ratelimit-remaining-requests"] ?? limits["x-ratelimit-remaining-tokens"];
+  const limit = limits["x-ratelimit-limit-requests"] ?? limits["x-ratelimit-limit-tokens"];
+  if (remaining != null && limit != null) return `剩余 ${remaining}/${limit}`;
+  if (remaining != null) return `剩余 ${remaining}`;
+  if (limits["retry-after"]) return `${limits["retry-after"]} 秒后重试`;
+  return "";
+}
+
+function renderAccountModels(item) {
+  if (!item.has_cpa) return '<span class="badge neutral">需先获取 CPA</span>';
+  const action = state.modelActions[item.email];
+  if (action?.startsWith("models")) return '<span class="badge neutral model-loading">正在获取模型…</span>';
+  const models = Array.isArray(item.models) ? item.models : [];
+  const tags = models.map(model => {
+    const test = item.model_tests?.[model];
+    const testing = action === `test:${model}` || action === "quota";
+    const statusClass = test ? (test.ok ? "available" : "limited") : "unknown";
+    const rateText = modelRateLimitText(test);
+    const title = test ? `${test.ok ? "测试通过" : "测试失败"} · HTTP ${test.status || 0}${rateText ? ` · ${rateText}` : ""} · 点击重新测试` : "点击测试此模型";
+    return `<button class="model-tag ${statusClass}${testing ? " testing" : ""}" type="button" data-email="${escapeHtml(item.email)}" data-model="${escapeHtml(model)}" title="${escapeHtml(title)}"><i></i>${escapeHtml(model)}${rateText ? `<small>${escapeHtml(rateText)}</small>` : ""}</button>`;
+  }).join("");
+  const checkedAt = item.models_checked_at ? new Date(item.models_checked_at).toLocaleString() : "";
+  if (tags) return `<div class="model-capabilities"><div class="model-tags">${tags}</div><small>${checkedAt ? `列表更新：${escapeHtml(checkedAt)}` : "点击标签可测试模型"}</small></div>`;
+  if (item.models_error) return `<span class="badge warning" title="${escapeHtml(item.models_error)}">模型获取失败</span>`;
+  return '<span class="badge neutral">尚未获取</span>';
 }
 
 function renderFailures() {
@@ -432,6 +478,25 @@ document.addEventListener("click", async event => {
   if (goto) navigate(goto.dataset.goto);
   const credential = event.target.closest(".credential-button");
   if (credential) showCredential(credential.dataset.email);
+  const cpaBackfill = event.target.closest(".cpa-backfill-button");
+  if (cpaBackfill) startTask("backfill", {limit:1, email:cpaBackfill.dataset.email, probe:true});
+  const credentialRefresh = event.target.closest(".refresh-credential-button");
+  if (credentialRefresh) {
+    const email = credentialRefresh.dataset.email;
+    if (confirm(`将刷新 ${email} 的 CPA 凭证。会优先使用 refresh_token，失败时自动重新执行 OIDC 获取，是否继续？`)) {
+      startTask("backfill", {limit:1, email, probe:true, refresh_existing:true});
+    }
+  }
+  const accountDelete = event.target.closest(".account-delete-button");
+  if (accountDelete) deleteSuccessAccount(accountDelete.dataset.email);
+  const cpaPush = event.target.closest(".cpa-push-button");
+  if (cpaPush) pushCpa([cpaPush.dataset.email], true);
+  const modelRefresh = event.target.closest(".refresh-models-button");
+  if (modelRefresh) refreshAccountModels(modelRefresh.dataset.email);
+  const quotaRefresh = event.target.closest(".refresh-quota-button");
+  if (quotaRefresh) refreshAccountQuota(quotaRefresh.dataset.email);
+  const modelTag = event.target.closest(".model-tag");
+  if (modelTag) testAccountModel(modelTag.dataset.email, modelTag.dataset.model);
   const copy = event.target.closest("[data-copy-target]");
   if (copy) copyText($(`#${copy.dataset.copyTarget}`).textContent);
   const reveal = event.target.closest(".reveal-config");
@@ -447,8 +512,113 @@ document.addEventListener("click", async event => {
   }
 });
 
+async function runModelAction(email, action, work) {
+  if (state.modelActions[email]) return;
+  state.modelActions[email] = action;
+  renderAccounts();
+  try {
+    await work();
+  } finally {
+    delete state.modelActions[email];
+    await loadAccounts();
+  }
+}
+
+async function refreshAccountModels(email) {
+  try {
+    await runModelAction(email, "models", async () => {
+      const result = await api("/api/account/models/refresh", {method:"POST", body:JSON.stringify({email})});
+      if (!result.ok) throw new Error(result.error || `模型接口返回 HTTP ${result.status || 0}`);
+      const prefix = result.credential_refreshed ? "凭证已自动刷新，" : "";
+      toast(`${prefix}模型列表已更新：${result.models.length ? result.models.join(", ") : "未返回模型"}`);
+    });
+  } catch (error) {
+    if (!offerFullCredentialRefresh(error, email)) toast(error.message, "error");
+  }
+}
+
+async function testAccountModel(email, model) {
+  try {
+    await runModelAction(email, `test:${model}`, async () => {
+      const result = await api("/api/account/model/test", {method:"POST", body:JSON.stringify({email, model})});
+      if (!result.ok) throw new Error(`${model} 测试失败：${result.error || `HTTP ${result.status || 0}`}`);
+      const rateText = modelRateLimitText({rate_limits:result.rate_limits});
+      const prefix = result.credential_refreshed ? "凭证已自动刷新 · " : "";
+      toast(`${prefix}${model} 测试通过 · HTTP ${result.status}${rateText ? ` · ${rateText}` : ""}`);
+    });
+  } catch (error) {
+    if (!offerFullCredentialRefresh(error, email)) toast(error.message, "error");
+  }
+}
+
+async function refreshAccountQuota(email) {
+  try {
+    await runModelAction(email, "quota", async () => {
+      const result = await api("/api/account/quota/refresh", {method:"POST", body:JSON.stringify({email})});
+      const available = (result.results || []).filter(item => item.ok).length;
+      const total = (result.results || []).length;
+      if (!result.ok) {
+        const denied = (result.results || []).filter(item => item.reason === "permission_denied").map(item => item.model);
+        if (denied.length) throw new Error(`账户没有聊天权限：${denied.join(", ")}。模型列表可见不代表可以调用，可删除该异常账户或在 xAI 控制台检查权限。`);
+        const failed = (result.results || []).filter(item => !item.ok).map(item => `${item.model}(HTTP ${item.status || 0})`).join(", ");
+        throw new Error(result.error || `额度状态刷新完成：${available}/${total} 个模型可用${failed ? `，受限：${failed}` : ""}`);
+      }
+      const prefix = result.credential_refreshed ? "凭证已自动刷新，" : "";
+      toast(`${prefix}额度状态已刷新：${available}/${total} 个模型可用`);
+    });
+  } catch (error) {
+    if (!offerFullCredentialRefresh(error, email)) toast(error.message, "error");
+  }
+}
+
+async function deleteSuccessAccount(email) {
+  const confirmed = confirm(`确定删除 ${email} 吗？\n\n将同时删除：成功账户记录、CPA 凭证、模型缓存、相关失败记录，以及对应的主邮箱配置。\n\n如果该账户使用“+别名”，主邮箱配置也会删除，之后不能再用它生成其他别名。已使用标记会保留，避免再次注册。此操作不可撤销。`);
+  if (!confirmed) return;
+  try {
+    const result = await api("/api/accounts/delete", {method:"POST", body:JSON.stringify({emails:[email]})});
+    toast(`删除完成：账户记录 ${result.account_rows} 条、邮箱配置 ${result.mailbox_rows} 条、CPA ${result.cpa_files} 个`);
+    await Promise.all([loadAccounts(), loadMailboxes(), loadFailures(), loadOverview()]);
+  } catch (error) { toast(error.message, "error"); }
+}
+
+async function pushCpa(emails = [], force = false) {
+  if (state.cpaPushRunning) return;
+  state.cpaPushRunning = true;
+  renderAccounts();
+  try {
+    const result = await api("/api/cpa/push", {method:"POST", body:JSON.stringify({emails, force})});
+    if (!result.ok) {
+      const detail = (result.failures || []).slice(0, 2).map(item => `${item.name}: ${item.error}`).join("；");
+      throw new Error(`CPA 推送部分失败：已上传 ${result.pushed}/${result.total}，已热加载 ${result.recognized}，已跳过 ${result.skipped || 0}${detail ? `；${detail}` : ""}`);
+    }
+    if (!result.pending) toast(`没有待推送凭证，已跳过 ${result.skipped} 个成功记录`);
+    else toast(`已推送到 ${result.target}：新增 ${result.recognized} 个，跳过 ${result.skipped || 0} 个已成功凭证`);
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    state.cpaPushRunning = false;
+    await loadAccounts();
+  }
+}
+
+async function pushAllCpa() {
+  return pushCpa([], false);
+}
+
+function offerFullCredentialRefresh(error, email) {
+  if (error?.code !== "credential_refresh_required") return false;
+  const accepted = confirm("该账户的 refresh_token 已失效，需要执行完整 OIDC 凭证重取。是否现在启动？");
+  if (accepted) {
+    startTask("backfill", {limit:1, email, probe:true, refresh_existing:true});
+  } else {
+    toast("凭证仍然失效，可稍后点击“刷新凭证”重新获取", "error");
+  }
+  return true;
+}
+
 $$(".nav-item").forEach(button => button.addEventListener("click", () => navigate(button.dataset.page)));
 $("#refreshButton").addEventListener("click", () => refreshAll(true));
+$("#pushCpa").addEventListener("click", pushAllCpa);
 $("#mailboxSearch").addEventListener("input", renderMailboxes);
 $("#accountSearch").addEventListener("input", renderAccounts);
 $("#failureSearch").addEventListener("input", renderFailures);
@@ -510,6 +680,12 @@ $("#retryFailures").addEventListener("click", async () => {
 $("#quickStart").addEventListener("click", () => startTask("register", {extra:$("#quickExtra").value, threads:$("#quickThreads").value}));
 $("#startRegister").addEventListener("click", () => startTask("register", {extra:$("#registerExtra").value, threads:$("#registerThreads").value, mint_workers:$("#registerMintWorkers").value}));
 $("#startBackfill").addEventListener("click", () => startTask("backfill", {limit:$("#backfillLimit").value, email:$("#backfillEmail").value, probe:$("#backfillProbe").checked}));
+$("#backfillMissingCpa").addEventListener("click", () => {
+  const missing = state.accounts.filter(item => !item.has_cpa);
+  if (!missing.length) return toast("所有成功账户都已经有 CPA 凭证");
+  if (!confirm(`将为 ${missing.length} 个缺少凭证的成功账户依次获取 CPA，是否继续？`)) return;
+  startTask("backfill", {limit:0, email:"", probe:true});
+});
 $("#stopTask").addEventListener("click", async () => {
   if (!confirm("确定停止当前任务吗？正在处理的账户可能会被标记为失败。")) return;
   try { renderTask(await api("/api/task/stop", {method:"POST", body:"{}"})); toast("任务已停止"); } catch (error) { toast(error.message, "error"); }
@@ -641,6 +817,7 @@ setInterval(async () => {
   try {
     await loadTask();
     if ($("#page-overview").classList.contains("active")) await loadOverview();
+    if ($("#page-accounts").classList.contains("active")) await loadAccounts();
   } catch { /* transient server restart */ }
 }, 1800);
 

@@ -32,6 +32,17 @@ def _opener(proxy: str | None = None) -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(*handlers) if handlers else urllib.request.build_opener()
 
 
+def _rate_limit_headers(headers: Any) -> dict[str, str]:
+    if headers is None:
+        return {}
+    out: dict[str, str] = {}
+    for key, value in headers.items():
+        lowered = str(key).strip().lower()
+        if lowered.startswith("x-ratelimit-") or lowered == "retry-after":
+            out[lowered] = str(value).strip()
+    return out
+
+
 def probe_models(
     access_token: str,
     *,
@@ -79,14 +90,18 @@ def probe_models(
 def probe_mini_response(
     access_token: str,
     *,
+    model: str = "grok-4.5",
     base_url: str = DEFAULT_BASE_URL,
     timeout: float = 60.0,
     proxy: str | None = None,
 ) -> dict[str, Any]:
+    model = str(model or "").strip()
+    if not model:
+        return {"ok": False, "status": 0, "model": "", "error": "model is required"}
     base = base_url.rstrip("/")
     url = f"{base}/responses"
     payload = {
-        "model": "grok-4.5",
+        "model": model,
         "stream": False,
         "input": "Reply with exactly MINT_OK",
         "reasoning": {"effort": "low"},
@@ -116,15 +131,17 @@ def probe_mini_response(
             return {
                 "ok": True,
                 "status": getattr(resp, "status", 200),
-                "model": body.get("model"),
+                "model": body.get("model") or model,
                 "text": "\n".join(texts),
                 "usage": body.get("usage"),
+                "rate_limits": _rate_limit_headers(resp.headers),
             }
     except urllib.error.HTTPError as e:
         return {
             "ok": False,
             "status": e.code,
             "error": e.read().decode("utf-8", errors="replace")[:800],
+            "rate_limits": _rate_limit_headers(e.headers),
         }
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "status": 0, "error": str(e)}
