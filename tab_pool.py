@@ -28,11 +28,12 @@ class TabPool:
     _thread_local = threading.local()
     _all_browsers: list[Any] = []
     _all_browsers_lock = threading.Lock()
+    _script_timeout_seconds = 12.0
 
     # ── public ──
 
     @classmethod
-    def init(cls, browser_options_or_factory, log_callback=None):
+    def init(cls, browser_options_or_factory, log_callback=None, script_timeout=None):
         """Save options object or factory. Callable → fresh options each create."""
         with cls._options_lock:
             if callable(browser_options_or_factory):
@@ -40,8 +41,25 @@ class TabPool:
             else:
                 # Shared options object: auto_port will NOT re-allocate.
                 cls._options_factory = lambda: browser_options_or_factory
+            if script_timeout is not None:
+                try:
+                    cls._script_timeout_seconds = max(3.0, min(60.0, float(script_timeout)))
+                except (TypeError, ValueError):
+                    cls._script_timeout_seconds = 12.0
         if log_callback:
-            log_callback("[*] TabPool 已初始化浏览器选项模板")
+            log_callback(
+                f"[*] TabPool 已初始化浏览器选项模板，脚本超时={cls._script_timeout_seconds:g}s"
+            )
+
+    @classmethod
+    def _configure_tab(cls, tab):
+        if tab is None:
+            return tab
+        try:
+            tab.set.timeouts(script=cls._script_timeout_seconds)
+        except Exception:
+            pass
+        return tab
 
     @classmethod
     def _create_browser(cls):
@@ -81,6 +99,7 @@ class TabPool:
             tab = browser.get_tab(tab_ids[0])
         else:
             tab = browser.new_tab()
+        tab = cls._configure_tab(tab)
         cls._thread_local.browser = browser
         cls._thread_local.tab = tab
         cls._thread_local.served = 0
@@ -94,7 +113,7 @@ class TabPool:
             return
         tabs = browser.tab_ids
         if tabs:
-            cls._thread_local.tab = browser.get_tab(tabs[-1])
+            cls._thread_local.tab = cls._configure_tab(browser.get_tab(tabs[-1]))
 
     @classmethod
     def clear_session(cls, log_callback=None) -> bool:
@@ -163,9 +182,9 @@ class TabPool:
                             browser.get_tab(tid).close()
                         except Exception:
                             pass
-                    cls._thread_local.tab = browser.get_tab(keep)
+                    cls._thread_local.tab = cls._configure_tab(browser.get_tab(keep))
                 elif tabs:
-                    cls._thread_local.tab = browser.get_tab(tabs[0])
+                    cls._thread_local.tab = cls._configure_tab(browser.get_tab(tabs[0]))
             except Exception:
                 cls.sync_tab()
             if log_callback:
@@ -193,7 +212,7 @@ class TabPool:
         browser = getattr(cls._thread_local, "browser", None)
         if browser is not None:
             try:
-                browser.quit(del_data=True)
+                browser.quit(timeout=5, force=True, del_data=True)
             except TypeError:
                 try:
                     browser.quit()
@@ -221,7 +240,7 @@ class TabPool:
             cls._all_browsers.clear()
         for b in browsers:
             try:
-                b.quit(del_data=True)
+                b.quit(timeout=5, force=True, del_data=True)
             except TypeError:
                 try:
                     b.quit()

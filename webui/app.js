@@ -15,6 +15,9 @@ const state = {
   proxyNodeTests: {},
   modelActions: {},
   cpaPushRunning: false,
+  registrationCountTouched: false,
+  registerCapacity: 0,
+  accountPushGroup: "all",
   importText: "",
   taskSignature: "",
 };
@@ -96,7 +99,15 @@ function renderOverview() {
   const item = state.overview;
   if (!item) return;
   $("#metricMailboxes").textContent = item.mailboxes;
-  $("#metricMailboxesHint").textContent = `${item.mailboxes_ready} 个尚未使用`;
+  const registerCapacity = Math.max(0, Number(item.register_capacity || 0));
+  state.registerCapacity = registerCapacity;
+  $("#metricMailboxesHint").textContent = `${registerCapacity} 个可注册名额`;
+  [$("#quickExtra"), $("#registerExtra")].forEach(input => {
+    input.max = String(Math.max(100, registerCapacity));
+    input.title = `当前可注册 ${registerCapacity} 个账户`;
+    if (!state.registrationCountTouched) input.value = String(registerCapacity);
+  });
+  updateRegistrationControls();
   $("#metricAccounts").textContent = item.accounts;
   $("#metricAccountsHint").textContent = `${item.accounts_with_sso} 个保留 SSO`;
   $("#metricCpa").textContent = item.accounts_with_cpa;
@@ -126,18 +137,26 @@ function renderOverview() {
   }
 }
 
+function updateRegistrationControls() {
+  $("#quickStart").disabled = state.registerCapacity === 0 || Number($("#quickExtra").value || 0) <= 0;
+  $("#startRegister").disabled = state.registerCapacity === 0 || Number($("#registerExtra").value || 0) <= 0;
+}
+
 function renderMailboxes() {
   const query = $("#mailboxSearch").value.trim().toLowerCase();
   const items = state.mailboxes.filter(item => item.email.toLowerCase().includes(query));
+  const invalidCount = state.mailboxes.filter(item => item.status === "oauth_expired").length;
   $("#mailboxCount").textContent = `${state.mailboxes.length} 条记录${state.mailboxPath ? ` · ${state.mailboxPath}` : ""}`;
   $("#mailboxCount").title = state.mailboxPath;
+  $("#deleteInvalidMailboxes").textContent = invalidCount ? `删除授权失效 (${invalidCount})` : "删除授权失效";
+  $("#deleteInvalidMailboxes").disabled = invalidCount === 0;
   $("#mailboxRows").innerHTML = items.map(item => {
-    const badge = item.status === "ready" ? ["success", "可使用"] : item.status === "active" ? ["neutral", "使用中"] : ["warning", "需关注"];
+    const badge = item.status === "oauth_expired" ? ["danger", "授权失效"] : item.status === "ready" ? ["success", "可使用"] : item.status === "active" ? ["neutral", "使用中"] : ["warning", "需关注"];
     return `<tr>
       <td class="check-cell"><input type="checkbox" class="mail-check" value="${escapeHtml(item.email)}"></td>
       <td><div class="email-cell"><span class="avatar">${escapeHtml(item.email.slice(0,1).toUpperCase())}</span><div><strong>${escapeHtml(item.email)}</strong><small>${escapeHtml(item.password_masked)}</small></div></div></td>
       <td class="mono">${escapeHtml(item.client_id_masked)}</td><td class="mono">${escapeHtml(item.token_masked)}</td>
-      <td>${item.used_count}</td><td>${item.failed_count}</td><td><span class="badge ${badge[0]}">● ${badge[1]}</span></td>
+      <td>${item.used_count}</td><td>${item.failed_count}</td><td><span class="badge ${badge[0]}" title="${escapeHtml(item.invalid_reason || "")}">● ${badge[1]}</span></td>
     </tr>`;
   }).join("");
   $("#mailboxEmpty").classList.toggle("visible", items.length === 0);
@@ -145,8 +164,19 @@ function renderMailboxes() {
 
 function renderAccounts() {
   const query = $("#accountSearch").value.trim().toLowerCase();
-  const items = state.accounts.filter(item => item.email.toLowerCase().includes(query));
-  $("#accountCount").textContent = `${state.accounts.length} 个账户`;
+  const pushedCount = state.accounts.filter(item => item.has_cpa && item.cpa_pushed).length;
+  const pendingCount = state.accounts.filter(item => item.has_cpa && !item.cpa_pushed).length;
+  const items = state.accounts.filter(item => {
+    if (!item.email.toLowerCase().includes(query)) return false;
+    if (state.accountPushGroup === "pushed") return item.has_cpa && item.cpa_pushed;
+    if (state.accountPushGroup === "pending") return item.has_cpa && !item.cpa_pushed;
+    return true;
+  });
+  $("#accountCount").textContent = `${state.accounts.length} 个账户 · 未推送 ${pendingCount} · 已推送 ${pushedCount}`;
+  $("#accountGroupAll").textContent = state.accounts.length;
+  $("#accountGroupPending").textContent = pendingCount;
+  $("#accountGroupPushed").textContent = pushedCount;
+  $$("[data-account-push-group]").forEach(button => button.classList.toggle("active", button.dataset.accountPushGroup === state.accountPushGroup));
   $("#accountRows").innerHTML = items.map(item => `<tr>
     <td><div class="email-cell"><span class="avatar">${escapeHtml(item.email.slice(0,1).toUpperCase())}</span><div><strong>${escapeHtml(item.email)}</strong><small>${escapeHtml(item.updated_at ? new Date(item.updated_at).toLocaleString() : "")}</small></div></div></td>
     <td class="mono">${escapeHtml(item.password_masked)}</td>
@@ -156,12 +186,16 @@ function renderAccounts() {
     <td>${escapeHtml(item.source)}</td><td><div class="table-row-actions"><button class="table-action credential-button" data-email="${escapeHtml(item.email)}">查看凭证</button>${item.has_cpa ? `<button class="table-action cpa-push-button" data-email="${escapeHtml(item.email)}" ${state.cpaPushRunning ? "disabled" : ""}>${item.cpa_pushed ? "重新推送" : "推送 CPA"}</button><button class="table-action refresh-credential-button" data-email="${escapeHtml(item.email)}">刷新凭证</button><button class="table-action refresh-models-button" data-email="${escapeHtml(item.email)}">${item.models?.length ? "刷新模型" : "获取模型"}</button><button class="table-action refresh-quota-button" data-email="${escapeHtml(item.email)}">刷新额度状态</button>` : `<button class="table-action cpa-backfill-button" data-email="${escapeHtml(item.email)}">获取 CPA</button>`}<button class="table-action account-delete-button" data-email="${escapeHtml(item.email)}">删除账户</button></div></td>
   </tr>`).join("");
   const missing = state.accounts.filter(item => !item.has_cpa).length;
-  const pendingCpaCount = state.accounts.filter(item => item.has_cpa && !item.cpa_pushed).length;
+  const pendingCpaCount = pendingCount;
   $("#backfillMissingCpa").textContent = missing ? `一键补全缺失 CPA (${missing})` : "CPA 已全部生成";
   $("#backfillMissingCpa").disabled = missing === 0;
   $("#pushCpa").textContent = state.cpaPushRunning ? "正在推送…" : pendingCpaCount ? `一键推送 CPA (${pendingCpaCount})` : "CPA 已全部推送";
   $("#pushCpa").disabled = state.cpaPushRunning || pendingCpaCount === 0;
   $("#accountEmpty").classList.toggle("visible", items.length === 0);
+  if (items.length === 0) {
+    const labels = {pending:"当前没有未推送账户", pushed:"当前没有已推送账户", all:"还没有成功账户"};
+    $("#accountEmpty strong").textContent = labels[state.accountPushGroup] || labels.all;
+  }
 }
 
 function modelRateLimitText(test) {
@@ -438,6 +472,7 @@ async function refreshAll(showToast = false) {
 async function startTask(kind, options) {
   try {
     const task = await api("/api/task/start", {method:"POST", body:JSON.stringify({kind, options})});
+    if (kind === "register") state.registrationCountTouched = false;
     renderTask(task);
     navigate("tasks");
     toast("任务已启动");
@@ -491,6 +526,11 @@ document.addEventListener("click", async event => {
   if (accountDelete) deleteSuccessAccount(accountDelete.dataset.email);
   const cpaPush = event.target.closest(".cpa-push-button");
   if (cpaPush) pushCpa([cpaPush.dataset.email], true);
+  const accountPushGroup = event.target.closest("[data-account-push-group]");
+  if (accountPushGroup) {
+    state.accountPushGroup = accountPushGroup.dataset.accountPushGroup;
+    renderAccounts();
+  }
   const modelRefresh = event.target.closest(".refresh-models-button");
   if (modelRefresh) refreshAccountModels(modelRefresh.dataset.email);
   const quotaRefresh = event.target.closest(".refresh-quota-button");
@@ -619,6 +659,10 @@ function offerFullCredentialRefresh(error, email) {
 $$(".nav-item").forEach(button => button.addEventListener("click", () => navigate(button.dataset.page)));
 $("#refreshButton").addEventListener("click", () => refreshAll(true));
 $("#pushCpa").addEventListener("click", pushAllCpa);
+[$("#quickExtra"), $("#registerExtra")].forEach(input => input.addEventListener("input", () => {
+  state.registrationCountTouched = true;
+  updateRegistrationControls();
+}));
 $("#mailboxSearch").addEventListener("input", renderMailboxes);
 $("#accountSearch").addEventListener("input", renderAccounts);
 $("#failureSearch").addEventListener("input", renderFailures);
@@ -663,6 +707,17 @@ $("#deleteMailboxes").addEventListener("click", async () => {
     const result = await api("/api/mailboxes/delete", {method:"POST", body:JSON.stringify({emails})});
     toast(`已删除 ${result.removed} 条邮箱凭证`);
     await Promise.all([loadMailboxes(), loadOverview()]);
+  } catch (error) { toast(error.message, "error"); }
+});
+
+$("#deleteInvalidMailboxes").addEventListener("click", async () => {
+  const count = state.mailboxes.filter(item => item.status === "oauth_expired").length;
+  if (!count) return toast("当前没有授权失效邮箱", "error");
+  if (!confirm(`确定一键删除 ${count} 个授权失效的主邮箱吗？\n\n这些邮箱的 refresh_token 已无法使用，不会再参与注册。相关注册失败记录也会一并清理。`)) return;
+  try {
+    const result = await api("/api/mailboxes/delete-invalid", {method:"POST", body:"{}"});
+    toast(`已删除 ${result.removed} 个授权失效邮箱，清理 ${result.failure_rows} 条失败记录`);
+    await Promise.all([loadMailboxes(), loadFailures(), loadOverview()]);
   } catch (error) { toast(error.message, "error"); }
 });
 

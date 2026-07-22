@@ -110,8 +110,78 @@ _hotmail_refresh_locks_lock = threading.Lock()
 
 _EMAILS_USED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emails_used.txt")
 _EMAILS_ERROR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "emails_error.txt")
+_HOTMAIL_INVALID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hotmail_invalid.txt")
 _SUCCESS_ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts_cli.txt")
 _email_track_lock = threading.Lock()
+
+
+class HotmailOAuthReauthRequired(Exception):
+    """The Microsoft refresh grant is unusable until the user signs in again."""
+
+
+def is_hotmail_oauth_reauth_required_error(error) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "aadsts70000",
+            "aadsts700082",
+            "aadsts70043",
+            "the grant is expired",
+            "the user must sign in again",
+            "user must sign in again",
+        )
+    )
+
+
+def _hotmail_invalid_emails():
+    invalid = set()
+    try:
+        with open(_HOTMAIL_INVALID_FILE, encoding="utf-8-sig") as f:
+            for raw in f:
+                email_addr = raw.split("----", 1)[0].strip().lower()
+                if email_addr and "@" in email_addr:
+                    invalid.add(email_addr)
+    except FileNotFoundError:
+        pass
+    return invalid
+
+
+def mark_hotmail_invalid(email_addr: str, reason: str, log_callback=None):
+    """Persist a main mailbox whose OAuth refresh grant requires interactive sign-in."""
+    email_addr = str(email_addr or "").strip().lower()
+    if not email_addr or "@" not in email_addr:
+        return False
+    clean_reason = " ".join(str(reason or "授权已失效，需要重新登录").split())[:500]
+    timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    with _email_track_lock:
+        existing = []
+        found = False
+        try:
+            with open(_HOTMAIL_INVALID_FILE, "r", encoding="utf-8-sig") as f:
+                existing = f.readlines()
+        except FileNotFoundError:
+            pass
+        output = []
+        for raw in existing:
+            current = raw.split("----", 1)[0].strip().lower()
+            if current == email_addr:
+                if not found:
+                    output.append(f"{email_addr}----{timestamp}----{clean_reason}\n")
+                    found = True
+                continue
+            output.append(raw if raw.endswith("\n") else raw + "\n")
+        if not found:
+            output.append(f"{email_addr}----{timestamp}----{clean_reason}\n")
+        tmp_path = _HOTMAIL_INVALID_FILE + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8", newline="\n") as f:
+            f.writelines(output)
+        os.replace(tmp_path, _HOTMAIL_INVALID_FILE)
+    if log_callback:
+        log_callback(f"[!] Hotmail 主邮箱授权已失效并停用: {email_addr}")
+    return True
 
 
 def mark_used(email: str, password: str = ""):
@@ -1512,9 +1582,12 @@ def hotmail_get_email_and_token():
     random_max_attempts = max(10, random_max_attempts)
 
     with _hotmail_selection_lock:
+        invalid_emails = _hotmail_invalid_emails()
         for acc in accounts:
             main_email = acc["email"].strip()
             if "@" not in main_email:
+                continue
+            if main_email.lower() in invalid_emails:
                 continue
             if _hotmail_count_consumed_for_main(main_email) >= max_aliases:
                 continue
@@ -1551,8 +1624,8 @@ def hotmail_get_email_and_token():
             }
             return candidate, token_key
     raise Exception(
-        "Hotmail/Outlook 可用别名已耗尽：请增加 hotmail_max_aliases_per_account、"
-        "补充 mail_credentials.txt，或清理 emails_used.txt / emails_error.txt"
+        "Hotmail/Outlook 可用别名已耗尽或主邮箱授权已失效：请补充 mail_credentials.txt、"
+        "删除授权失效邮箱，或清理 emails_used.txt / emails_error.txt"
     )
 
 
@@ -1630,6 +1703,12 @@ def hotmail_refresh_access_token(account, log_callback=None):
                         log_callback(f"[*] Hotmail OAuth2 access_token 刷新成功: {email_addr}")
                     return access_token
                 last_error = token_data.get("error_description") or token_data.get("error") or resp.text[:200]
+                if is_hotmail_oauth_reauth_required_error(last_error):
+                    message = f"Hotmail OAuth2 refresh 失败: {last_error}"
+                    mark_hotmail_invalid(email_addr, message, log_callback=log_callback)
+                    raise HotmailOAuthReauthRequired(message)
+            except HotmailOAuthReauthRequired:
+                raise
             except Exception as exc:
                 last_error = exc
                 continue
@@ -1836,6 +1915,8 @@ def hotmail_get_oai_code(
                 return code
             if log_callback:
                 log_callback(f"[Debug] Hotmail/Outlook 本轮未找到验证码: {email}")
+        except HotmailOAuthReauthRequired:
+            raise
         except Exception as exc:
             # OAuth/IMAP 临时失败时下一轮重新 refresh access_token。
             access_token = None
@@ -2277,9 +2358,17 @@ def _set_page(value):
 
 def start_browser(log_callback=None):
     last_exc = None
+    try:
+        script_timeout = float(config.get("browser_script_timeout_sec", 12) or 12)
+    except (TypeError, ValueError):
+        script_timeout = 12.0
     for attempt in range(1, 5):
         try:
-            TabPool.init(create_browser_options, log_callback=log_callback)
+            TabPool.init(
+                create_browser_options,
+                log_callback=log_callback,
+                script_timeout=script_timeout,
+            )
             page = TabPool.get_tab()
             if log_callback and attempt > 1:
                 log_callback(f"[*] 浏览器第 {attempt} 次启动成功")
@@ -4140,8 +4229,12 @@ class GrokRegisterGUI:
                         mark_error(email, reason=msg[:120])
                     except Exception:
                         pass
-                if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                    logf(f"[!] 本邮箱未取到验证码，自动更换新邮箱重试: {msg}")
+                if (
+                    "未收到验证码" in msg
+                    or "验证码" in msg
+                    or is_hotmail_oauth_reauth_required_error(msg)
+                ) and mail_try < max_mail_retry:
+                    logf(f"[!] 本邮箱不可用，自动更换新邮箱重试: {msg}")
                     restart_browser(log_callback=logf)
                     sleep_with_cancel(1, self.should_stop)
                     continue

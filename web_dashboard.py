@@ -14,6 +14,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,11 +53,13 @@ MAIL_PATH = ROOT / "mail_credentials.txt"
 ACCOUNTS_PATH = ROOT / "accounts_cli.txt"
 EMAILS_USED_PATH = ROOT / "emails_used.txt"
 EMAILS_ERROR_PATH = ROOT / "emails_error.txt"
+HOTMAIL_INVALID_PATH = ROOT / "hotmail_invalid.txt"
 CPA_DIR = ROOT / "cpa_auths"
 CPA_FAIL_PATH = CPA_DIR / "cpa_auth_failed.txt"
 BACKFILL_FAIL_PATH = CPA_DIR / "backfill_failed.jsonl"
 CPA_MANAGEMENT_URL = "http://127.0.0.1:8317"
 CPA_PUSH_STATUS_FILE = ".cpa_push_status.json"
+DRISSION_PROFILE_ROOT = Path("/tmp/DrissionPage/autoPortData")
 
 FILE_LOCK = threading.RLock()
 MAX_BODY_BYTES = 12 * 1024 * 1024
@@ -68,6 +71,62 @@ class FullCredentialRefreshRequired(ValueError):
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def project_browser_pids() -> list[int]:
+    if os.name == "nt" or not Path("/proc").is_dir():
+        return []
+    marker = str(DRISSION_PROFILE_ROOT) + "/"
+    pids: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(
+                "utf-8", errors="ignore"
+            )
+            process_name = (entry / "comm").read_text(
+                encoding="utf-8", errors="ignore"
+            ).strip().lower()
+        except (FileNotFoundError, PermissionError, ProcessLookupError, OSError):
+            continue
+        if marker in command and ("chrome" in process_name or "chromium" in process_name):
+            pids.append(int(entry.name))
+    return pids
+
+
+def cleanup_project_browsers(grace_seconds: float = 2.0) -> int:
+    pids = project_browser_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+    if pids:
+        deadline = time.time() + max(0.0, grace_seconds)
+        while time.time() < deadline and project_browser_pids():
+            time.sleep(0.1)
+        for pid in project_browser_pids():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+
+    if os.name != "nt" and DRISSION_PROFILE_ROOT.is_dir():
+        try:
+            resolved = DRISSION_PROFILE_ROOT.resolve()
+            if resolved == Path("/tmp/DrissionPage/autoPortData"):
+                for child in list(resolved.iterdir()):
+                    try:
+                        if child.is_dir() and not child.is_symlink():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return len(pids)
 
 
 def read_text(path: Path) -> str:
@@ -120,12 +179,12 @@ def cpa_management_settings() -> tuple[str, str]:
     config = load_json_object(CONFIG_PATH)
     url = cpa_management_base_url()
     key = str(
-        os.environ.get("CPA_MANAGEMENT_KEY")
-        or config.get("cpa_management_key")
+        config.get("cpa_management_key")
+        or os.environ.get("CPA_MANAGEMENT_KEY")
         or ""
     ).strip()
     if not key:
-        raise ValueError("CPA 管理密钥未配置")
+        raise ValueError("CPA 管理密码/密钥未配置")
     return url, key
 
 
@@ -453,6 +512,73 @@ def tracked_email_counts() -> tuple[dict[str, int], dict[str, int]]:
     return used, failed
 
 
+def hotmail_invalid_accounts() -> dict[str, dict[str, str]]:
+    invalid: dict[str, dict[str, str]] = {}
+    for line in read_lines(HOTMAIL_INVALID_PATH):
+        parts = line.split("----", 2)
+        email = parts[0].strip().lower() if parts else ""
+        if not email or "@" not in email:
+            continue
+        invalid[email] = {
+            "email": email,
+            "time": parts[1].strip() if len(parts) > 1 else "",
+            "reason": parts[2].strip() if len(parts) > 2 else "授权已失效，需要重新登录",
+        }
+    return invalid
+
+
+def clear_hotmail_invalid_markers(emails: set[str]) -> int:
+    wanted = {str(email).strip().lower() for email in emails if str(email).strip()}
+    if not wanted:
+        return 0
+    original = read_lines(HOTMAIL_INVALID_PATH)
+    kept = [line for line in original if line.split("----", 1)[0].strip().lower() not in wanted]
+    removed = len(original) - len(kept)
+    if HOTMAIL_INVALID_PATH.exists() or removed:
+        atomic_write(HOTMAIL_INVALID_PATH, ("\n".join(kept) + "\n") if kept else "")
+    return removed
+
+
+def tracked_registration_emails() -> set[str]:
+    consumed: set[str] = set()
+    paths = [*account_files(), EMAILS_USED_PATH, EMAILS_ERROR_PATH]
+    for path in paths:
+        for line in read_lines(path):
+            email = line.split("----", 1)[0].strip().lower()
+            if email and "@" in email:
+                consumed.add(email)
+    return consumed
+
+
+def registration_capacity(
+    mailbox_records: list[dict[str, str]] | None = None,
+    consumed_emails: set[str] | None = None,
+    max_aliases: int | None = None,
+    invalid_emails: set[str] | None = None,
+) -> int:
+    if mailbox_records is None:
+        mailbox_records, _ = parse_mail_text(read_text(current_mail_path()))
+    if consumed_emails is None:
+        consumed_emails = tracked_registration_emails()
+    if max_aliases is None:
+        config = load_json_object(CONFIG_PATH)
+        try:
+            max_aliases = int(config.get("hotmail_max_aliases_per_account", 5) or 5)
+        except (TypeError, ValueError):
+            max_aliases = 5
+    if invalid_emails is None:
+        invalid_emails = set(hotmail_invalid_accounts())
+    limit = max(1, int(max_aliases))
+    return sum(
+        max(
+            0,
+            limit - sum(1 for email in consumed_emails if is_alias_of(email, record["email"])),
+        )
+        for record in mailbox_records
+        if record["email"].lower() not in invalid_emails
+    )
+
+
 def is_alias_of(candidate: str, main_email: str) -> bool:
     if "@" not in candidate or "@" not in main_email:
         return candidate.lower() == main_email.lower()
@@ -464,9 +590,11 @@ def is_alias_of(candidate: str, main_email: str) -> bool:
 def list_mailboxes() -> list[dict[str, Any]]:
     records, _ = parse_mail_text(read_text(current_mail_path()))
     used, failed = tracked_email_counts()
+    invalid = hotmail_invalid_accounts()
     out = []
     for record in records:
         email = record["email"]
+        invalid_record = invalid.get(email.lower())
         used_count = sum(count for item, count in used.items() if is_alias_of(item, email))
         failed_count = sum(count for item, count in failed.items() if is_alias_of(item, email))
         out.append(
@@ -478,7 +606,9 @@ def list_mailboxes() -> list[dict[str, Any]]:
                 "token_masked": mask(record["token"], left=5, right=5),
                 "used_count": used_count,
                 "failed_count": failed_count,
-                "status": "attention" if failed_count else ("active" if used_count else "ready"),
+                "status": "oauth_expired" if invalid_record else ("attention" if failed_count else ("active" if used_count else "ready")),
+                "invalid_reason": invalid_record["reason"] if invalid_record else "",
+                "invalid_time": invalid_record["time"] if invalid_record else "",
             }
         )
     return out
@@ -523,6 +653,7 @@ def remove_mailboxes(emails: list[str]) -> int:
     removed = len(records) - len(kept)
     with FILE_LOCK:
         atomic_write(target_path, ("\n".join(item["raw"] for item in kept) + "\n") if kept else "")
+        clear_hotmail_invalid_markers(wanted)
     return removed
 
 
@@ -1020,6 +1151,31 @@ def clear_failures(emails: list[str]) -> int:
         )
 
 
+def remove_invalid_mailboxes() -> dict[str, Any]:
+    invalid = hotmail_invalid_accounts()
+    main_emails = set(invalid)
+    if not main_emails:
+        return {"ok": True, "removed": 0, "invalid_markers": 0, "failure_rows": 0}
+
+    def is_related_failure(line: str) -> bool:
+        failed_email = line.split("----", 1)[0].strip().lower()
+        return bool(failed_email) and any(is_alias_of(failed_email, main) for main in main_emails)
+
+    with FILE_LOCK:
+        removed = remove_mailboxes(list(main_emails))
+        original_failures = read_lines(EMAILS_ERROR_PATH)
+        kept_failures = [line for line in original_failures if not is_related_failure(line)]
+        failure_rows = len(original_failures) - len(kept_failures)
+        if EMAILS_ERROR_PATH.exists() or failure_rows:
+            atomic_write(EMAILS_ERROR_PATH, ("\n".join(kept_failures) + "\n") if kept_failures else "")
+    return {
+        "ok": True,
+        "removed": removed,
+        "invalid_markers": len(main_emails),
+        "failure_rows": failure_rows,
+    }
+
+
 def load_json_object(path: Path) -> dict[str, Any]:
     try:
         data = json.loads(read_text(path))
@@ -1067,10 +1223,11 @@ def friendly_label(key: str) -> str:
         "user_agent": "浏览器 User-Agent",
         "register_count": "默认注册数量",
         "register_threads": "注册并发数",
+        "browser_script_timeout_sec": "浏览器脚本硬超时",
         "cpa_export_enabled": "注册后生成 CPA 凭证",
         "cpa_auth_dir": "CPA 凭证目录",
         "cpa_management_url": "CPA 管理地址",
-        "cpa_management_key": "CPA 管理密钥",
+        "cpa_management_key": "CPA 管理密码/密钥",
         "cpa_proxy": "CPA 专用代理",
         "cpa_prefer_protocol": "优先使用协议模式",
         "cpa_protocol_only": "仅使用协议模式",
@@ -1209,7 +1366,10 @@ def config_payload() -> dict[str, Any]:
         value = current.get(key, template.get(key))
         field_type = "boolean" if isinstance(value, bool) else "number" if isinstance(value, (int, float)) else "string"
         lowered = key.lower()
-        secret = any(word in lowered for word in ("password", "token", "app_key", "api_key", "jwt", "secret", "subscription"))
+        secret = key == "cpa_management_key" or any(
+            word in lowered
+            for word in ("password", "token", "app_key", "api_key", "jwt", "secret", "subscription")
+        )
         fields.append(
             {
                 "key": key,
@@ -1300,6 +1460,7 @@ class TaskManager:
         with self.lock:
             if self.process and self.process.poll() is None:
                 raise RuntimeError("已有任务正在运行")
+            cleaned_browsers = cleanup_project_browsers()
             synced: int | None = None
             if kind in {"register", "backfill"}:
                 synced = sync_primary_accounts_ledger()
@@ -1326,7 +1487,10 @@ class TaskManager:
                 bufsize=1,
                 env=env,
                 creationflags=creationflags,
+                start_new_session=os.name != "nt",
             )
+            if cleaned_browsers:
+                self.append(f"启动前已清理残留浏览器进程：{cleaned_browsers} 个")
             if synced is not None:
                 self.append(f"已同步主账本：{synced} 个成功账户")
             self.append(f"启动任务：{kind}")
@@ -1401,13 +1565,29 @@ class TaskManager:
             self.append(f"任务输出读取失败: {exc}", "error")
             code = process.poll() if process else -1
         with self.lock:
+            cleaned_browsers = cleanup_project_browsers()
             self.returncode = code
             if self.status == "stopping":
                 self.status = "stopped"
             else:
                 self.status = "completed" if code == 0 else "failed"
             self.ended_at = now_iso()
+            if cleaned_browsers:
+                self.append(f"任务结束后已回收浏览器进程：{cleaned_browsers} 个")
             self.append(f"任务结束，退出码 {code}", "success" if code == 0 else "error")
+
+    @staticmethod
+    def _signal_process_group(process: subprocess.Popen[str], sig: int) -> None:
+        if os.name == "nt":
+            if sig == signal.SIGTERM:
+                process.send_signal(signal.CTRL_BREAK_EVENT)
+            else:
+                process.kill()
+            return
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
 
     def stop(self) -> dict[str, Any]:
         with self.lock:
@@ -1417,16 +1597,15 @@ class TaskManager:
             self.status = "stopping"
             self.append("正在停止任务…", "warning")
             try:
-                if os.name == "nt":
-                    process.send_signal(signal.CTRL_BREAK_EVENT)
-                else:
-                    process.terminate()
+                self._signal_process_group(process, signal.SIGTERM)
             except Exception:
                 process.terminate()
         try:
             process.wait(timeout=8)
         except subprocess.TimeoutExpired:
-            process.kill()
+            self._signal_process_group(process, signal.SIGKILL)
+            process.wait(timeout=3)
+        cleanup_project_browsers()
         return self.snapshot()
 
     def snapshot(self) -> dict[str, Any]:
@@ -1452,9 +1631,11 @@ def overview_payload() -> dict[str, Any]:
     accounts = discover_accounts()
     failures = list_failures()
     config = load_json_object(CONFIG_PATH)
+    capacity = registration_capacity()
     return {
         "mailboxes": len(mailboxes),
         "mailboxes_ready": sum(1 for item in mailboxes if item["status"] == "ready"),
+        "register_capacity": capacity,
         "accounts": len(accounts),
         "accounts_with_sso": sum(1 for item in accounts if item.get("sso")),
         "accounts_with_cpa": sum(1 for item in accounts if item.get("cpa_path")),
@@ -1650,6 +1831,8 @@ h1{{margin:20px 0 7px;font-size:24px;letter-spacing:-.6px}}p{{margin:0 0 24px;co
             if path == "/api/mailboxes/delete":
                 removed = remove_mailboxes(list(body.get("emails") or []))
                 return self.json_response({"ok": True, "removed": removed})
+            if path == "/api/mailboxes/delete-invalid":
+                return self.json_response(remove_invalid_mailboxes())
             if path == "/api/accounts/delete":
                 return self.json_response(remove_success_accounts(list(body.get("emails") or [])))
             if path == "/api/cpa/push":

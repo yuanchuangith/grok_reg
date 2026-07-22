@@ -68,7 +68,7 @@
               <div class="panel-heading"><div><p class="eyebrow">QUICK START</p><h2>开始新的注册任务</h2></div><span class="soft-badge" id="providerBadge">未配置</span></div>
               <p class="muted">使用当前配置和邮箱池启动任务，成功的账户与 SSO 会实时写入主账本。</p>
               <div class="quick-form">
-                <label><span>新增账户</span><input id="quickExtra" type="number" value="1" min="1" max="100"></label>
+                <label><span>新增账户</span><input id="quickExtra" type="number" value="0" min="0" max="100"></label>
                 <label><span>并发线程</span><input id="quickThreads" type="number" value="1" min="1" max="10"></label>
                 <button class="primary-button" id="quickStart">启动注册</button>
               </div>
@@ -97,6 +97,7 @@
             <div><strong>邮箱凭证池</strong><span id="mailboxCount">0 条记录</span></div>
             <div class="toolbar-actions">
               <div class="search-box"><span>⌕</span><input id="mailboxSearch" placeholder="搜索邮箱"></div>
+              <button class="danger-button" id="deleteInvalidMailboxes" disabled>删除授权失效</button>
               <button class="secondary-button" id="deleteMailboxes">删除所选</button>
               <button class="primary-button" id="openImport">导入邮箱</button>
             </div>
@@ -119,6 +120,14 @@
               <a class="secondary-button as-link" href="/api/export/cpa">打包 CPA</a>
               <button class="primary-button" id="pushCpa" type="button">一键推送 CPA</button>
             </div>
+          </div>
+          <div class="account-group-bar panel compact">
+            <div class="account-group-tabs" id="accountPushGroups">
+              <button type="button" class="active" data-account-push-group="all">全部 <span id="accountGroupAll">0</span></button>
+              <button type="button" data-account-push-group="pending">未推送 <span id="accountGroupPending">0</span></button>
+              <button type="button" data-account-push-group="pushed">已推送 <span id="accountGroupPushed">0</span></button>
+            </div>
+            <small>一键推送只处理“未推送”账户；已推送账户仍可单独重新推送。</small>
           </div>
           <article class="panel table-panel">
             <div class="table-wrap">
@@ -149,7 +158,7 @@
           <div class="task-grid">
             <article class="panel task-card">
               <div class="task-icon blue">▶</div><div><p class="eyebrow">REGISTER</p><h2>注册新账户</h2><p>从邮箱池选择可用地址，执行注册并保存 SSO/CPA。</p></div>
-              <div class="form-grid"><label><span>新增数量</span><input id="registerExtra" type="number" value="1" min="1" max="100"></label><label><span>注册线程</span><input id="registerThreads" type="number" value="1" min="1" max="10"></label><label><span>Mint Workers</span><input id="registerMintWorkers" type="number" value="-1" min="-1" max="10"></label></div>
+              <div class="form-grid"><label><span>新增数量</span><input id="registerExtra" type="number" value="0" min="0" max="100"></label><label><span>注册线程</span><input id="registerThreads" type="number" value="1" min="1" max="10"></label><label><span>Mint Workers</span><input id="registerMintWorkers" type="number" value="-1" min="-1" max="10"></label></div>
               <button class="primary-button wide" id="startRegister">启动注册任务</button>
             </article>
             <article class="panel task-card">

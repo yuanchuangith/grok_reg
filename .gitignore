@@ -15,6 +15,7 @@ config.json.bak*
 accounts_*.txt
 emails_used.txt
 mail_credentials.txt
+hotmail_invalid.txt
 cpa_auths/
 cookies/
 screenshots/

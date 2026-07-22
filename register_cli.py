@@ -12,6 +12,7 @@ Browser lifecycle:
 """
 from __future__ import annotations
 
+import atexit
 import argparse
 import os
 import queue
@@ -25,6 +26,22 @@ from typing import Any
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import grok_register_ttk as reg  # noqa: E402
+
+
+def _shutdown_all_browsers() -> None:
+    try:
+        reg.shutdown_browser()
+    except Exception:
+        pass
+    try:
+        from cpa_xai.browser_confirm import shutdown_mint_browsers
+
+        shutdown_mint_browsers()
+    except Exception:
+        pass
+
+
+atexit.register(_shutdown_all_browsers)
 
 
 # Linux 适配: DrissionPage 默认找 'chrome', 我们装的是 chromium
@@ -263,8 +280,12 @@ def register_one(
             break
         except Exception as exc:
             msg = str(exc)
-            if ("未收到验证码" in msg or "验证码" in msg) and mail_try < max_mail_retry:
-                log(worker_id, f"! 本邮箱未取到验证码，换邮箱重试: {msg}")
+            if (
+                "未收到验证码" in msg
+                or "验证码" in msg
+                or reg.is_hotmail_oauth_reauth_required_error(msg)
+            ) and mail_try < max_mail_retry:
+                log(worker_id, f"! 本邮箱不可用，换邮箱重试: {msg}")
                 _mark_email_stage_error(email, msg)
                 try:
                     reg.restart_browser(log_callback=lambda m: log(worker_id, m))
@@ -600,7 +621,11 @@ def main() -> int:
     log_thread.start()
 
     try:
-        reg.TabPool.init(reg.create_browser_options, log_callback=lambda m: log(0, m))
+        reg.TabPool.init(
+            reg.create_browser_options,
+            log_callback=lambda m: log(0, m),
+            script_timeout=(getattr(reg, "config", {}) or {}).get("browser_script_timeout_sec", 12),
+        )
     except Exception as exc:
         print(f"[!] 浏览器初始化失败: {exc}", flush=True)
         return 1
@@ -662,10 +687,7 @@ def main() -> int:
         for t in mint_threads:
             t.join(timeout=600)
 
-    try:
-        reg.shutdown_browser()
-    except Exception:
-        pass
+    _shutdown_all_browsers()
 
     # stop side-effect pool
     try:

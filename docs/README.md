@@ -1,87 +1,157 @@
-# 开发文档中心
+# Grok Account Studio 项目上下文
 
-这里是项目需求、设计、变更、运维和技术决策的统一入口。
+- 最后更新：2026-07-13
+- 当前阶段：Web 管理控制台持续完善
+- 线上状态：8318 Web 服务和 8317 CLIProxyAPI 均已部署运行
+- 文档规则：本项目只维护这一份上下文文档；只有用户明确要求“写入文档”时才更新
 
-## 文档树
+## 项目用途
 
-```text
-docs/
-├─ README.md
-├─ 00-project-status/
-│  ├─ README.md
-│  ├─ current-status.md
-│  ├─ known-issues.md
-│  └─ progress-log.md
-├─ 01-requirements/
-│  ├─ README.md
-│  └─ requirement-index.md
-├─ 02-design/
-│  ├─ README.md
-│  └─ system-overview.md
-├─ 03-changes/
-│  ├─ README.md
-│  └─ change-index.md
-├─ 04-operations/
-│  ├─ README.md
-│  └─ deployment-index.md
-├─ 05-decisions/
-│  ├─ README.md
-│  └─ decision-index.md
-└─ templates/
-   ├─ requirement-template.md
-   ├─ change-template.md
-   ├─ deployment-template.md
-   ├─ decision-template.md
-   └─ status-update-template.md
-```
+该项目用于管理 Grok/xAI 账户注册流程，包括邮箱凭证池、Chromium 自动注册、验证码读取、Cloudflare Turnstile、SSO 保留、CPA/OIDC 凭证生成、模型验证、代理池和 CLIProxyAPI 推送。
 
-## 后续开发读取顺序
+Web 页面采用 macOS 风格，服务端通过密码登录访问。服务器使用无界面 Chromium，但自动化流程仍会在 Xvfb 中运行完整浏览器。
 
-开始新的开发任务时，按以下顺序了解项目：
-
-1. `docs/00-project-status/current-status.md`：查看当前能力、进度、部署和下一步。
-2. `docs/00-project-status/known-issues.md`：查看仍存在的问题、风险和规避方式。
-3. `docs/01-requirements/requirement-index.md`：找到相关需求。
-4. `docs/03-changes/change-index.md`：确认已经实现过哪些变更。
-5. 根据任务继续读取对应的设计、运维或技术决策文档。
-
-不要求每次把所有模板都读一遍；状态页和问题页是必须读取的交接入口。
-
-## 记录规则
-
-开发和讨论过程中默认不自动归档。只有收到明确的写入命令后，才更新这里的文档。
-
-可使用的命令示例：
-
-- `把本次需求写入开发文档`
-- `记录本次变更`
-- `把部署结果写入文档`
-- `记录这个技术决策`
-- `把本次需求和实现一起归档`
-
-执行归档时：
-
-1. 新需求写入 `01-requirements/`，并更新需求索引。
-2. 已完成的代码或界面改动写入 `03-changes/`，并更新变更索引。
-3. 架构、接口和数据结构说明写入 `02-design/`。
-4. 部署、回滚和验证结果写入 `04-operations/`。
-5. 有明显取舍的技术选择写入 `05-decisions/`。
-6. 同步更新 `00-project-status/` 中受影响的当前状态、已知问题和进度日志。
-
-## 编号规范
-
-- 需求：`REQ-YYYYMMDD-NNN`
-- 变更：`CHG-YYYYMMDD-NNN`
-- 部署：`DEP-YYYYMMDD-NNN`
-- 决策：`ADR-YYYYMMDD-NNN`
-
-同一天从 `001` 开始递增。详细文档文件名使用编号加简短英文标识，例如：
+## 项目树
 
 ```text
-REQ-20260713-001-account-model-tags.md
-CHG-20260713-001-account-model-tags.md
+grok_reg-protocol_cpa/
+├─ AGENTS.md                         项目协作和文档规则
+├─ docs/README.md                    唯一开发上下文文档
+├─ web_dashboard.py                 8318 Web 后端、账户/邮箱/配置/任务 API
+├─ webui/
+│  ├─ index.html                    Web 页面结构
+│  ├─ app.js                        页面状态、交互和 API 调用
+│  └─ styles.css                    macOS 风格样式
+├─ register_cli.py                  批量注册、线程和 CPA mint 队列
+├─ grok_register_ttk.py             浏览器注册、邮箱分配、验证码和 Turnstile
+├─ proxy_pool.py                    Mihomo/Clash 与静态代理池
+├─ config.example.json              全部可配置项模板
+├─ config.json                      实际运行配置，不应写入敏感文档
+├─ mail_credentials.txt             邮箱四段凭证，不应写入文档
+├─ accounts_cli.txt                 成功账户主账本
+├─ emails_used.txt                  已使用邮箱，防止重复注册
+├─ emails_error.txt                 失败邮箱记录
+├─ cpa_auths/                       CPA xai-*.json 和隐藏状态缓存
+├─ cpa_xai/
+│  ├─ mint.py                       CPA/OIDC 凭证生成
+│  ├─ oauth_device.py               xAI OAuth Device Flow
+│  ├─ probe.py                      模型和最小请求探测
+│  ├─ refresh.py                    refresh_token 安全刷新
+│  ├─ model_capabilities.py         模型列表、测试和推送外的能力缓存
+│  └─ writer.py                     CPA 文件原子写入
+├─ scripts/                         CPA 补全、导出和迁移脚本
+└─ turnstilePatch/                  Chromium 扩展与 Turnstile 辅助
 ```
 
-## 安全要求
+## 当前主要能力
 
-文档中不得记录密码、私钥、访问令牌、带 Token 的订阅地址、完整代理认证信息或完整账户凭证。服务器地址如确有必要记录，也应与密钥和密码分离。
+### 邮箱与注册
+
+- 导入、搜索和删除 Hotmail/Outlook 四段凭证。
+- 原邮箱优先，之后使用随机 `+别名`。
+- 成功、失败和当前占用地址去重。
+- 已成功邮箱保留在 `emails_used.txt`，不会再次注册。
+- 注册页面使用浏览器原生点击和键盘事件，提高服务器兼容性。
+- 自动读取验证码、等待 Turnstile、提交资料并保留 SSO。
+- 注册数量默认使用剩余邮箱容量，而不是固定为 1。
+- 容量公式：各主邮箱的最大地址数减去成功、已使用和失败的去重地址数。
+- 随机代理模式下注册线程限制为 1；任务数量不等于线程数量。
+
+### 成功账户管理
+
+- 展示密码掩码、SSO、CPA 文件、模型 Tag 和来源。
+- 单账户查看凭证、获取 CPA、刷新凭证、刷新模型和测试额度状态。
+- 异常账户可以删除；同时清理成功账本、CPA、模型缓存、失败记录和对应主邮箱配置。
+- 删除账户仍保留已使用邮箱标记，防止再次注册。
+- 账户可按“全部、未推送、已推送”分组。
+
+### CPA 凭证
+
+- 注册后可自动生成 xAI CPA/OIDC 凭证。
+- 优先使用 SSO 协议 Device Flow，必要时回退浏览器流程。
+- 已有凭证支持 refresh_token 快速刷新；失败时执行完整 OIDC 兜底。
+- 新凭证必须验证成功后才替换旧文件；失败时恢复旧文件。
+- 模型列表、模型测试和额度状态请求必须走代理。
+- 模型结果使用独立隐藏缓存，不修改 CPA JSON 格式。
+
+### 推送到 CLIProxyAPI
+
+- 从 8318 一键推送 `xai-*.json` 到 8317 Management API。
+- 上传后读取远端凭证列表，确认热加载成功后才标记“已推送”。
+- 推送状态保存在 `cpa_auths/.cpa_push_status.json`，包含内容指纹、目标和时间。
+- 一键推送只处理未推送或内容已经变化的凭证。
+- 已推送账户可以单独重新推送。
+- 管理地址和管理密码/密钥位于“配置中心 → CPA / OIDC”。
+- 页面配置优先；留空时使用服务器环境变量兜底。
+- Management API 密码不是普通 `/v1` API Key。
+
+### 代理网络
+
+- 支持 Clash/Mihomo 多订阅分组和静态账号密码代理。
+- 两种代理模式互斥。
+- 支持随机节点、手动固定、节点测活和失败切换。
+- Web 服务与注册任务复用同一个 Mihomo 实例。
+- 模型、额度和 CPA 请求不允许在代理开启时静默泄漏到直连。
+
+## 关键设计决定
+
+- 模型信息使用独立缓存，由用户主动刷新，避免账户列表轮询不断请求上游。
+- 模型和额度接口强制走代理；瞬时网络错误最多重试三次。
+- 凭证刷新采用“refresh_token 优先、OIDC 兜底、验证后替换”。
+- CPA 推送使用文件 SHA-256 和目标地址去重，不向凭证 JSON 写入界面状态。
+- 成功账户删除保留 `emails_used.txt`，防止同一邮箱重新注册。
+- 服务器只建议一个注册线程；CPA mint worker 建议一个。
+
+## 最近完成的改动
+
+### 2026-07-13
+
+- 建成 macOS 风格 Web 控制台并部署到 8318。
+- 增加密码登录、邮箱导入、成功/失败账户管理和配置中心。
+- 增加 Clash 多订阅、静态代理、随机/手动选择和测活页面。
+- 修复服务器端注册页按钮、邮箱输入和最终提交的原生事件兼容性。
+- 增加关键注册和代理日志编号。
+- 增加成功账户模型 Tag、模型列表刷新、单模型测试和额度状态。
+- 增加 CPA refresh_token 刷新、OIDC 兜底、验证后原子替换和旧文件恢复。
+- 增加异常成功账户删除，并联动删除主邮箱配置和本地凭证数据。
+- 增加 CPA 一键推送、成功标记、指纹去重、单账户重推和状态分组。
+- 增加可配置 CPA 管理地址与管理密码；密码字段隐藏，页面配置优先。
+- 增加可注册名额计算，快速启动和任务中心默认使用剩余容量。
+- 线上验证首次推送 4 个凭证全部热加载，第二次推送跳过 4 个成功记录。
+- 线上验证 96 个主邮箱、每个最多 5 个地址、已消耗 5 个时显示 475 个可注册名额。
+
+## 当前部署
+
+- 8318：Grok Account Studio Web 服务，systemd 服务名 `grok-account-studio.service`。
+- 8317：CLIProxyAPI，systemd 服务名 `cliproxyapi.service`。
+- 两项服务最近验证状态均为 `active`。
+- 8317 Management API 最近验证返回 HTTP 200。
+- 部署验证后不保留 `/tmp` 临时回滚目录。
+
+## 已知问题和约束
+
+- 服务器出口或代理节点仍可能被 Cloudflare 判定为异常流量。
+- 随机代理共用全局 `PROXY_POOL` 选择器，多注册线程会互相切换出口，因此限制为一个线程。
+- 模型列表可见不代表账户具有聊天权限；HTTP 403 `permission-denied` 显示为“无聊天权限”。
+- 模型额度刷新只是重新测试状态，不会增加上游额度。
+- refresh_token 失效时的完整 OIDC 兜底仍可能受到 Cloudflare 影响。
+- 可注册名额是别名槽位，不是主邮箱文件行数。例如 96 个主邮箱、每个 5 个地址、已消耗 5 个时为 475。
+- CPA 推送状态是本地成功记录。如果 8317 文件被外部删除，本地未变化的一键推送仍会跳过，需要单账户“重新推送”。
+- 在页面保存 CPA 管理密码会写入服务器 `config.json`；生产环境优先使用环境变量。
+- 服务器约为 2 核、2GB 内存，不建议三个及以上浏览器或 mint 并发。
+
+## 后续建议
+
+1. 增加本地 CPA 推送状态与 8317 远端凭证的主动对账。
+2. 增加批量检测并刷新失效 CPA 凭证。
+3. 增加全部账户批量刷新模型。
+4. 展示凭证过期时间和最近刷新时间。
+5. 为 Cloudflare 失败保存受控页面快照，继续改善服务器诊断。
+
+## 文档更新规则
+
+- 后续开发先完整读取本文件。
+- 普通讨论、临时日志和调试过程不自动写入。
+- 只有用户明确要求“写入文档”时，才更新本文件相关章节。
+- 只记录大致上下文、关键改动、部署状态、约束和下一步，不拆分成其他文档。
+- 不得记录密码、私钥、访问令牌、带 Token 的订阅地址、代理凭证或完整账户凭证。
