@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from .model_capabilities import record_model_list
 from .oauth_device import refresh_access_token
-from .probe import probe_models
+from .probe import probe_mini_response, probe_models
 from .schema import DEFAULT_BASE_URL, DEFAULT_TOKEN_ENDPOINT, expired_from_access_token
 from .writer import write_cpa_xai_auth
 
@@ -38,6 +38,7 @@ def refresh_cpa_auth(
     *,
     proxy: str,
     probe: bool = True,
+    probe_chat: bool = False,
     timeout: float = 30.0,
     log: LogFn | None = None,
 ) -> dict[str, Any]:
@@ -102,6 +103,20 @@ def refresh_cpa_auth(
             reason = str(probe_result.get("error") or "grok-4.5 not available")[:200]
             raise CredentialRefreshError(f"refreshed token verification failed HTTP {status}: {reason}")
 
+    chat_probe_result: dict[str, Any] | None = None
+    if probe_chat:
+        log("[CPA-REFRESH-102B] 验证新 access_token 的真实对话权限")
+        chat_probe_result = probe_mini_response(
+            tokens.access_token,
+            base_url=str(updated.get("base_url") or DEFAULT_BASE_URL),
+            proxy=proxy,
+            timeout=max(timeout, 45.0),
+        )
+        if not chat_probe_result.get("ok"):
+            status = int(chat_probe_result.get("status") or 0)
+            reason = str(chat_probe_result.get("error") or "chat probe failed")[:300]
+            raise CredentialRefreshError(f"refreshed token chat verification failed HTTP {status}: {reason}")
+
     written = write_cpa_xai_auth(auth_path.parent, updated, filename=auth_path.name)
     if probe_result is not None:
         record_model_list(auth_path.parent, email, probe_result)
@@ -112,4 +127,5 @@ def refresh_cpa_auth(
         "path": str(written),
         "refresh_method": "refresh_token",
         "probe_models": probe_result,
+        "probe_chat": chat_probe_result,
     }

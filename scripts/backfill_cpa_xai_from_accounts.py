@@ -13,6 +13,7 @@ Example (from grok_reg project root):
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 import os
 import shutil
@@ -33,6 +34,52 @@ from cpa_xai import (  # noqa: E402
     write_cpa_xai_auth,
 )
 import proxy_pool  # noqa: E402
+
+
+PERMANENT_INVALID_FILE = ".account_permanent_invalid.json"
+
+
+def permanent_access_denied(result: dict[str, object]) -> str:
+    error = str(result.get("error") or "").strip()
+    lowered = error.lower()
+    if (
+        lowered.startswith("device auth token error:")
+        and "invalid_grant" in lowered
+        and "access denied" in lowered
+    ):
+        return error[:500]
+    return ""
+
+
+def mark_permanent_invalid(auth_dir: str | Path, email: str, reason: str) -> Path:
+    path = Path(auth_dir) / PERMANENT_INVALID_FILE
+    payload: dict[str, object] = {"version": 1, "results": {}}
+    if path.is_file():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(current, dict):
+                payload.update(current)
+        except Exception:
+            pass
+    rows = payload.get("results")
+    if not isinstance(rows, dict):
+        rows = {}
+        payload["results"] = rows
+    marked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    normalized = email.strip().lower()
+    rows[normalized] = {
+        "email": normalized,
+        "reason": "xAI 已完成授权页面，但拒绝签发 OIDC 凭证",
+        "error_code": "invalid_grant",
+        "error_message": reason,
+        "marked_at": marked_at,
+    }
+    payload["updated_at"] = marked_at
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return path
 
 
 def find_auth_path(auth_dir: str | Path, email: str) -> Path | None:
@@ -56,6 +103,11 @@ def main() -> int:
     ap.add_argument(
         "--accounts",
         default=str(_ROOT / "accounts_cli.txt"),
+    )
+    ap.add_argument(
+        "--emails-file",
+        default="",
+        help="Optional newline-delimited email allow-list",
     )
     ap.add_argument(
         "--out-dir",
@@ -155,6 +207,13 @@ def main() -> int:
     print(f"proxy={args.proxy or '(none)'}", flush=True)
 
     accounts = parse_accounts_file(args.accounts)
+    if args.emails_file:
+        selected_emails = {
+            line.strip().lower()
+            for line in Path(args.emails_file).read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        }
+        accounts = [a for a in accounts if a.email.lower() in selected_emails]
     if args.email:
         accounts = [a for a in accounts if a.email.lower() == args.email.lower()]
     accounts = accounts[args.offset :]
@@ -206,6 +265,7 @@ def main() -> int:
                         existing_path,
                         proxy=args.proxy,
                         probe=args.probe,
+                        probe_chat=args.probe_chat,
                         timeout=min(args.timeout, 90.0),
                         log=log,
                     )
@@ -254,6 +314,17 @@ def main() -> int:
                 print(f"copied -> {dst}", flush=True)
         else:
             fail_n += 1
+            permanent_reason = permanent_access_denied(r)
+            if permanent_reason:
+                marker_path = mark_permanent_invalid(
+                    args.out_dir,
+                    acc.email,
+                    permanent_reason,
+                )
+                log(
+                    "[CPA-REAUTH-410] xAI 拒绝签发 OIDC 凭证，已标记永久失效并跳过；"
+                    f"marker={marker_path.name}"
+                )
             if args.fail_log:
                 Path(args.fail_log).parent.mkdir(parents=True, exist_ok=True)
                 with open(args.fail_log, "a", encoding="utf-8") as f:

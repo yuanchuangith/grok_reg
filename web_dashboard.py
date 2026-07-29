@@ -13,6 +13,7 @@ import io
 import json
 import mimetypes
 import os
+import queue
 import re
 import shutil
 import signal
@@ -59,6 +60,9 @@ CPA_FAIL_PATH = CPA_DIR / "cpa_auth_failed.txt"
 BACKFILL_FAIL_PATH = CPA_DIR / "backfill_failed.jsonl"
 CPA_MANAGEMENT_URL = "http://127.0.0.1:8317"
 CPA_PUSH_STATUS_FILE = ".cpa_push_status.json"
+ACCOUNT_INSPECTION_FILE = ".account_inspection.json"
+ACCOUNT_REAUTH_FILE = ".account_inspection_reauth.txt"
+ACCOUNT_PERMANENT_INVALID_FILE = ".account_permanent_invalid.json"
 DRISSION_PROFILE_ROOT = Path("/tmp/DrissionPage/autoPortData")
 
 FILE_LOCK = threading.RLock()
@@ -410,10 +414,19 @@ def model_test_reason(item: dict[str, Any]) -> str:
         return "available"
     status = int(item.get("status") or 0)
     error = str(item.get("error") or "").lower()
-    if status == 403 and (
+    if status in {402, 403} or (
         "permission-denied" in error or "access to the chat endpoint is denied" in error
     ):
         return "permission_denied"
+    if any(
+        marker in error
+        for marker in (
+            "free-usage-exhausted",
+            "used all the included free usage",
+            "included free usage has been exhausted",
+        )
+    ):
+        return "quota_exhausted"
     if status == 429:
         return "quota_limited"
     if status == 401 or "invalid or expired credentials" in error or "no auth context" in error:
@@ -424,6 +437,7 @@ def model_test_reason(item: dict[str, Any]) -> str:
 def public_account(
     record: dict[str, Any],
     push_registry: dict[str, Any] | None = None,
+    inspection_results: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     cpa_path = Path(record["cpa_path"]) if record.get("cpa_path") else None
     push_state = (
@@ -438,6 +452,7 @@ def public_account(
     )
     raw_tests = capability.get("tests")
     tests = raw_tests if isinstance(raw_tests, dict) else {}
+    inspection = (inspection_results or {}).get(str(record.get("email") or "").strip().lower()) or {}
     return {
         "id": stable_id(record["email"]),
         "email": record["email"],
@@ -456,6 +471,12 @@ def public_account(
         "models_status": int(capability.get("models_status") or 0),
         "models_error": str(capability.get("models_error") or ""),
         "models_checked_at": str(capability.get("checked_at") or ""),
+        "inspection": {
+            "classification": str(inspection.get("classification") or ""),
+            "reason": str(inspection.get("reason") or ""),
+            "status": int(inspection.get("status") or 0),
+            "checked_at": str(inspection.get("checked_at") or ""),
+        },
         "model_tests": {
             str(model): {
                 "ok": bool(item.get("ok")),
@@ -555,20 +576,28 @@ def registration_capacity(
     consumed_emails: set[str] | None = None,
     max_aliases: int | None = None,
     invalid_emails: set[str] | None = None,
+    single_account_per_mailbox: bool | None = None,
 ) -> int:
     if mailbox_records is None:
         mailbox_records, _ = parse_mail_text(read_text(current_mail_path()))
     if consumed_emails is None:
         consumed_emails = tracked_registration_emails()
-    if max_aliases is None:
+    if max_aliases is None or single_account_per_mailbox is None:
         config = load_json_object(CONFIG_PATH)
+    else:
+        config = {}
+    if max_aliases is None:
         try:
             max_aliases = int(config.get("hotmail_max_aliases_per_account", 5) or 5)
         except (TypeError, ValueError):
             max_aliases = 5
+    if single_account_per_mailbox is None:
+        single_account_per_mailbox = bool(
+            config.get("hotmail_single_account_per_mailbox", False)
+        )
     if invalid_emails is None:
         invalid_emails = set(hotmail_invalid_accounts())
-    limit = max(1, int(max_aliases))
+    limit = 1 if single_account_per_mailbox else max(1, int(max_aliases))
     return sum(
         max(
             0,
@@ -737,6 +766,7 @@ def remove_success_accounts(emails: list[str]) -> dict[str, Any]:
             auth_dirs[0],
             {path.name for path in auth_paths if path.parent == auth_dirs[0]},
         )
+        permanent_markers = clear_permanent_invalid_markers(wanted)
 
     return {
         "ok": True,
@@ -747,6 +777,7 @@ def remove_success_accounts(emails: list[str]) -> dict[str, Any]:
         "cpa_files": cpa_files,
         "model_caches": model_caches,
         "push_markers": push_markers,
+        "permanent_markers": permanent_markers,
         "used_markers_retained": True,
     }
 
@@ -804,8 +835,10 @@ def invalid_cpa_auth_result(result: dict[str, Any]) -> bool:
     markers = (
         "invalid or expired credentials",
         "no auth context",
-        "permissiondenied",
         "invalid_token",
+        "invalid_grant",
+        "token is expired",
+        "token has been invalidated",
     )
     return status == 401 or any(marker in error for marker in markers)
 
@@ -1000,6 +1033,427 @@ def refresh_account_quota(email: str) -> dict[str, Any]:
         "credential_refreshed": credential_refreshed,
         "error": "" if results else "该账户没有可测试的模型",
     }
+
+
+def account_inspection_path() -> Path:
+    return current_cpa_dir() / ACCOUNT_INSPECTION_FILE
+
+
+def account_permanent_invalid_path() -> Path:
+    return current_cpa_dir() / ACCOUNT_PERMANENT_INVALID_FILE
+
+
+def permanent_invalid_accounts() -> dict[str, dict[str, str]]:
+    payload = load_json_object(account_permanent_invalid_path())
+    rows = payload.get("results")
+    if not isinstance(rows, dict):
+        return {}
+    return {
+        str(email).strip().lower(): {
+            "email": str(email).strip().lower(),
+            "reason": str(item.get("reason") or "xAI 拒绝签发 OIDC 凭证"),
+            "error_code": str(item.get("error_code") or "invalid_grant"),
+            "error_message": str(item.get("error_message") or "Access denied"),
+            "marked_at": str(item.get("marked_at") or ""),
+        }
+        for email, item in rows.items()
+        if str(email).strip() and isinstance(item, dict)
+    }
+
+
+def clear_permanent_invalid_markers(emails: set[str]) -> int:
+    wanted = {str(email).strip().lower() for email in emails if str(email).strip()}
+    if not wanted:
+        return 0
+    path = account_permanent_invalid_path()
+    payload = load_json_object(path)
+    rows = payload.get("results")
+    if not isinstance(rows, dict):
+        return 0
+    removed = 0
+    for email in list(rows):
+        if str(email).strip().lower() in wanted:
+            rows.pop(email, None)
+            removed += 1
+    if removed:
+        payload["updated_at"] = now_iso()
+        atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    return removed
+
+
+def parse_probe_error(raw_error: str) -> tuple[str, str]:
+    raw_error = str(raw_error or "").strip()
+    if not raw_error:
+        return "", ""
+    try:
+        payload = json.loads(raw_error)
+    except json.JSONDecodeError:
+        return "", raw_error[:400]
+    if not isinstance(payload, dict):
+        return "", raw_error[:400]
+    code = str(payload.get("code") or "").strip()
+    error = payload.get("error")
+    if isinstance(error, dict):
+        code = code or str(error.get("code") or "").strip()
+        message = str(error.get("message") or error.get("error") or "").strip()
+    else:
+        message = str(error or payload.get("message") or "").strip()
+    return code[:160], message[:400]
+
+
+def classify_account_probe(result: dict[str, Any]) -> dict[str, str]:
+    status = int(result.get("status") or 0)
+    code, message = parse_probe_error(str(result.get("error") or ""))
+    blob = f"{code} {message} {result.get('error') or ''}".lower()
+    if status == 401 or any(
+        marker in blob
+        for marker in (
+            "token is expired",
+            "token has been invalidated",
+            "invalid_grant",
+            "invalid_token",
+            "invalid or expired credentials",
+            "no auth context",
+            "unauthorized",
+        )
+    ):
+        return {"classification": "reauth", "reason": "认证已过期或失效", "action": "refresh"}
+    if any(
+        marker in blob
+        for marker in (
+            "free-usage-exhausted",
+            "used all the included free usage",
+            "included free usage has been exhausted",
+        )
+    ):
+        return {"classification": "quota_exhausted", "reason": "免费额度已用尽", "action": "keep"}
+    if status == 429:
+        return {"classification": "probe_error", "reason": "临时限流 (HTTP 429)，建议稍后重试", "action": "retry"}
+    if status in {402, 403} or any(
+        marker in blob
+        for marker in (
+            "permission-denied",
+            "permission denied",
+            "chat endpoint is denied",
+            "personal-team-blocked",
+            "deactivated",
+            "suspended",
+            "banned",
+        )
+    ):
+        suffix = f" (HTTP {status})" if status else ""
+        return {"classification": "permission_denied", "reason": f"对话权限被拒绝{suffix}", "action": "keep"}
+    if status == 404 or any(marker in blob for marker in ("not-found", "does not exist", "no access to it")):
+        return {"classification": "model_unavailable", "reason": "测试模型不可用", "action": "keep"}
+    if result.get("ok") or 200 <= status < 300:
+        return {"classification": "healthy", "reason": "对话测试成功", "action": "keep"}
+    reason = message or str(result.get("error") or "").strip() or "探测失败"
+    if status and reason == "探测失败":
+        reason = f"探测失败 (HTTP {status})"
+    return {"classification": "probe_error", "reason": reason[:400], "action": "retry"}
+
+
+class AccountInspectionManager:
+    CLASSIFICATIONS = (
+        "healthy",
+        "reauth",
+        "permanent_invalid",
+        "quota_exhausted",
+        "permission_denied",
+        "model_unavailable",
+        "probe_error",
+    )
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.status = "idle"
+        self.started_at = ""
+        self.ended_at = ""
+        self.updated_at = ""
+        self.model = "grok-4.5"
+        self.total = 0
+        self.completed = 0
+        self.results: dict[str, dict[str, Any]] = {}
+        self._restore()
+
+    def _restore(self) -> None:
+        payload = load_json_object(account_inspection_path())
+        rows = payload.get("results")
+        if isinstance(rows, dict):
+            self.results = {
+                str(email).strip().lower(): dict(item)
+                for email, item in rows.items()
+                if str(email).strip() and isinstance(item, dict)
+            }
+        self._sync_permanent_invalid_locked()
+        self.status = str(payload.get("status") or "idle")
+        if self.status in {"running", "stopping"}:
+            self.status = "stopped"
+        self.started_at = str(payload.get("started_at") or "")
+        self.ended_at = str(payload.get("ended_at") or "")
+        self.updated_at = str(payload.get("updated_at") or "")
+        self.model = str(payload.get("model") or "grok-4.5")
+        self.total = max(int(payload.get("total") or 0), len(self.results))
+        self.completed = max(int(payload.get("completed") or 0), len(self.results))
+
+    def _sync_permanent_invalid_locked(self) -> int:
+        changed = 0
+        for email, marker in permanent_invalid_accounts().items():
+            current = self.results.get(email) or {}
+            row = {
+                "email": email,
+                "file": str(current.get("file") or f"xai-{email}.json"),
+                "classification": "permanent_invalid",
+                "action": "delete",
+                "reason": marker["reason"],
+                "status": 400,
+                "error_code": marker["error_code"],
+                "error_message": marker["error_message"],
+                "attempts": int(current.get("attempts") or 0),
+                "checked_at": marker["marked_at"] or now_iso(),
+            }
+            if current != row:
+                self.results[email] = row
+                changed += 1
+        return changed
+
+    def _persist_locked(self) -> None:
+        atomic_write(
+            account_inspection_path(),
+            json.dumps(
+                {
+                    "version": 1,
+                    "status": self.status,
+                    "started_at": self.started_at,
+                    "ended_at": self.ended_at,
+                    "updated_at": self.updated_at,
+                    "model": self.model,
+                    "total": self.total,
+                    "completed": self.completed,
+                    "results": self.results,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+        )
+
+    def start(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        options = options or {}
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                raise RuntimeError("账户巡检正在运行")
+            workers = max(1, min(10, int(options.get("workers", 3))))
+            model = str(options.get("model") or "grok-4.5").strip()
+            if not model or len(model) > 120 or not re.fullmatch(r"[A-Za-z0-9._:/-]+", model):
+                raise ValueError("巡检模型名称格式无效")
+            permanent = set(permanent_invalid_accounts())
+            targets = [
+                item
+                for item in discover_accounts()
+                if item.get("cpa_path")
+                and str(item.get("email") or "").strip().lower() not in permanent
+            ]
+            if not targets:
+                if not permanent:
+                    raise ValueError("当前没有可巡检的 CPA 凭证")
+            self.stop_event.clear()
+            self.status = "running"
+            self.started_at = now_iso()
+            self.ended_at = ""
+            self.updated_at = self.started_at
+            self.model = model
+            self.results = {}
+            self._sync_permanent_invalid_locked()
+            self.total = len(targets) + len(self.results)
+            self.completed = len(self.results)
+            self._persist_locked()
+            self.thread = threading.Thread(
+                target=self._run,
+                args=(targets, workers),
+                daemon=True,
+                name="account-inspection",
+            )
+            self.thread.start()
+            return self.snapshot()
+
+    def _probe_one(self, record: dict[str, Any]) -> dict[str, Any]:
+        email = str(record.get("email") or "").strip().lower()
+        checked_at = now_iso()
+        try:
+            auth_path, auth = load_cpa_auth(email)
+            base_url = str(auth.get("base_url") or DEFAULT_BASE_URL).rstrip("/")
+            result: dict[str, Any] = {}
+            attempts = 0
+            for attempt in range(1, 3):
+                attempts = attempt
+                proxy = cpa_probe_proxy(f"{base_url}/responses")
+                result = probe_mini_response(
+                    str(auth.get("access_token") or ""),
+                    model=self.model,
+                    base_url=base_url,
+                    timeout=45.0,
+                    proxy=proxy,
+                )
+                classified = classify_account_probe(result)
+                if classified["classification"] != "probe_error" or self.stop_event.is_set():
+                    break
+                time.sleep(0.5)
+            classified = classify_account_probe(result)
+            code, message = parse_probe_error(str(result.get("error") or ""))
+            return {
+                "email": email,
+                "file": auth_path.name,
+                "classification": classified["classification"],
+                "action": classified["action"],
+                "reason": classified["reason"],
+                "status": int(result.get("status") or 0),
+                "error_code": code,
+                "error_message": message,
+                "attempts": attempts,
+                "checked_at": checked_at,
+            }
+        except Exception as exc:  # noqa: BLE001
+            return {
+                "email": email,
+                "file": Path(str(record.get("cpa_path") or "")).name,
+                "classification": "probe_error",
+                "action": "retry",
+                "reason": str(exc)[:400],
+                "status": 0,
+                "error_code": "",
+                "error_message": str(exc)[:400],
+                "attempts": 0,
+                "checked_at": checked_at,
+            }
+
+    def _run(self, targets: list[dict[str, Any]], workers: int) -> None:
+        pending: queue.Queue[dict[str, Any]] = queue.Queue()
+        for item in targets:
+            pending.put(item)
+
+        def worker() -> None:
+            while not self.stop_event.is_set():
+                try:
+                    record = pending.get_nowait()
+                except queue.Empty:
+                    return
+                result = self._probe_one(record)
+                with self.lock:
+                    self.results[result["email"]] = result
+                    self.completed += 1
+                    self.updated_at = now_iso()
+                    if self.completed % 5 == 0 or self.completed >= self.total:
+                        self._persist_locked()
+                pending.task_done()
+
+        threads = [
+            threading.Thread(target=worker, daemon=True, name=f"account-inspection-{index + 1}")
+            for index in range(min(workers, len(targets)))
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        with self.lock:
+            self.status = "stopped" if self.stop_event.is_set() else "completed"
+            self.ended_at = now_iso()
+            self.updated_at = self.ended_at
+            self._persist_locked()
+
+    def stop(self) -> dict[str, Any]:
+        with self.lock:
+            if not self.thread or not self.thread.is_alive():
+                return self.snapshot()
+            self.status = "stopping"
+            self.stop_event.set()
+            self.updated_at = now_iso()
+            self._persist_locked()
+            return self.snapshot()
+
+    def reauth_emails(self) -> list[str]:
+        return self.action_emails("reauth")
+
+    def healthy_emails(self) -> list[str]:
+        return self.action_emails("healthy")
+
+    def action_emails(self, classification: str) -> list[str]:
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                raise RuntimeError("账户巡检运行中，请等待完成或停止后再执行批量操作")
+            self._sync_permanent_invalid_locked()
+            return sorted(
+                email
+                for email, item in self.results.items()
+                if item.get("classification") == classification
+            )
+
+    def delete_abnormal_accounts(self, emails: list[str]) -> dict[str, Any]:
+        wanted = {
+            str(email).strip().lower() for email in emails if str(email).strip()
+        }
+        if not wanted:
+            raise ValueError("请选择要删除的异常账户")
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                raise RuntimeError("账户巡检运行中，停止或等待完成后再删除")
+            self._sync_permanent_invalid_locked()
+            missing = sorted(email for email in wanted if email not in self.results)
+            healthy = sorted(
+                email
+                for email in wanted
+                if self.results.get(email, {}).get("classification") == "healthy"
+            )
+        if missing:
+            raise ValueError("部分账户没有当前巡检结果，请重新巡检后再删除")
+        if healthy:
+            raise ValueError("健康账户不能从异常账户删除入口删除")
+
+        result = remove_success_accounts(sorted(wanted))
+        result["inspection_rows"] = self.remove_accounts(wanted)
+        return result
+
+    def remove_accounts(self, emails: set[str] | list[str]) -> int:
+        wanted = {
+            str(email).strip().lower() for email in emails if str(email).strip()
+        }
+        with self.lock:
+            removed = 0
+            for email in wanted:
+                if self.results.pop(email, None) is not None:
+                    removed += 1
+            self.total = max(0, self.total - removed)
+            self.completed = max(0, self.completed - removed)
+            self.updated_at = now_iso()
+            self._persist_locked()
+        return removed
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            if self._sync_permanent_invalid_locked():
+                self.total = max(self.total, len(self.results))
+                self.completed = max(self.completed, len(self.results))
+                self.updated_at = now_iso()
+                self._persist_locked()
+            summary = {name: 0 for name in self.CLASSIFICATIONS}
+            for item in self.results.values():
+                name = str(item.get("classification") or "probe_error")
+                summary[name if name in summary else "probe_error"] += 1
+            return {
+                "status": self.status,
+                "running": bool(self.thread and self.thread.is_alive()),
+                "started_at": self.started_at,
+                "ended_at": self.ended_at,
+                "updated_at": self.updated_at,
+                "model": self.model,
+                "total": self.total,
+                "completed": self.completed,
+                "summary": summary,
+                "items": sorted(self.results.values(), key=lambda item: str(item.get("email") or "")),
+                "path": str(account_inspection_path()),
+            }
 
 
 def discover_accounts() -> list[dict[str, Any]]:
@@ -1236,6 +1690,7 @@ def friendly_label(key: str) -> str:
         "grok2api_remote_app_key": "Grok2API App Key",
         "hotmail_accounts_file": "Hotmail 凭证文件",
         "hotmail_max_aliases_per_account": "单邮箱最大别名数",
+        "hotmail_single_account_per_mailbox": "单邮箱仅注册一个账户",
     }
     if key in labels:
         return labels[key]
@@ -1431,6 +1886,9 @@ def save_proxy_configuration(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+ACCOUNT_INSPECTION = AccountInspectionManager()
+
+
 class TaskManager:
     def __init__(self) -> None:
         self.lock = threading.RLock()
@@ -1462,7 +1920,7 @@ class TaskManager:
                 raise RuntimeError("已有任务正在运行")
             cleaned_browsers = cleanup_project_browsers()
             synced: int | None = None
-            if kind in {"register", "backfill"}:
+            if kind in {"register", "backfill", "refresh_invalid"}:
                 synced = sync_primary_accounts_ledger()
             command = self._build_command(kind, options)
             env = os.environ.copy()
@@ -1548,6 +2006,27 @@ class TaskManager:
             if email:
                 command.extend(("--email", email))
             return command
+        if kind == "refresh_invalid":
+            emails_file = Path(str(options.get("emails_file") or "")).expanduser().resolve()
+            expected = (current_cpa_dir() / ACCOUNT_REAUTH_FILE).resolve()
+            if emails_file != expected or not emails_file.is_file():
+                raise ValueError("失效凭证刷新清单无效，请重新从账户巡检页面启动")
+            return [
+                python,
+                "-u",
+                str(ROOT / "scripts" / "backfill_cpa_xai_from_accounts.py"),
+                "--accounts",
+                str(ACCOUNTS_PATH),
+                "--emails-file",
+                str(emails_file),
+                "--refresh-existing",
+                "--probe",
+                "--probe-chat",
+                "--sleep",
+                "1",
+                "--timeout",
+                "300",
+            ]
         if kind == "check":
             return [python, "-u", str(ROOT / "optimization_checks.py")]
         raise ValueError("未知任务类型")
@@ -1624,6 +2103,46 @@ class TaskManager:
 
 
 TASKS = TaskManager()
+
+
+def start_invalid_credential_refresh(emails: list[str]) -> dict[str, Any]:
+    refreshable = set(ACCOUNT_INSPECTION.reauth_emails())
+    requested = {str(email).strip().lower() for email in emails if str(email).strip()}
+    selected = sorted(refreshable if not requested else refreshable & requested)
+    if not selected:
+        raise ValueError("当前巡检结果中没有可刷新的认证失效凭证")
+    known_accounts = {item["email"].lower() for item in discover_accounts()}
+    selected = [email for email in selected if email in known_accounts]
+    if not selected:
+        raise ValueError("认证失效账户已不在成功账户账本中")
+    list_path = current_cpa_dir() / ACCOUNT_REAUTH_FILE
+    atomic_write(list_path, "\n".join(selected) + "\n")
+    task = TASKS.start("refresh_invalid", {"emails_file": str(list_path)})
+    task["refresh_count"] = len(selected)
+    return task
+
+
+def push_healthy_inspection_cpa(emails: list[str]) -> dict[str, Any]:
+    healthy = set(ACCOUNT_INSPECTION.healthy_emails())
+    requested = {str(email).strip().lower() for email in emails if str(email).strip()}
+    if requested:
+        rejected = sorted(requested - healthy)
+        if rejected:
+            raise ValueError("只能推送当前巡检结果为健康的账户")
+        selected = sorted(requested)
+    else:
+        selected = sorted(healthy)
+    if not selected:
+        raise ValueError("当前巡检结果中没有可推送的健康账户")
+
+    accounts = {item["email"].lower(): item for item in discover_accounts()}
+    missing = [email for email in selected if not accounts.get(email, {}).get("cpa_path")]
+    if missing:
+        raise ValueError("部分健康账户缺少本地 CPA 凭证，请重新巡检后再推送")
+
+    result = push_cpa_auths_to_management(emails=selected, force=False)
+    result["healthy_count"] = len(selected)
+    return result
 
 
 def overview_payload() -> dict[str, Any]:
@@ -1787,8 +2306,19 @@ h1{{margin:20px 0 7px;font-size:24px;letter-spacing:-.6px}}p{{margin:0 0 24px;co
                 return self.json_response({"items": list_mailboxes(), "invalid_count": len(invalid), "total": len(records), "path": str(mail_path)})
             if path == "/api/accounts":
                 push_registry = read_cpa_push_status()
-                items = [public_account(item, push_registry) for item in discover_accounts()]
+                inspection_rows = ACCOUNT_INSPECTION.snapshot().get("items") or []
+                inspection_results = {
+                    str(item.get("email") or "").strip().lower(): item
+                    for item in inspection_rows
+                    if isinstance(item, dict) and str(item.get("email") or "").strip()
+                }
+                items = [
+                    public_account(item, push_registry, inspection_results)
+                    for item in discover_accounts()
+                ]
                 return self.json_response({"items": items, "total": len(items)})
+            if path == "/api/account-inspection":
+                return self.json_response(ACCOUNT_INSPECTION.snapshot())
             if path == "/api/account/credential":
                 email = str((query.get("email") or [""])[0]).strip().lower()
                 account = next((item for item in discover_accounts() if item["email"].lower() == email), None)
@@ -1834,7 +2364,28 @@ h1{{margin:20px 0 7px;font-size:24px;letter-spacing:-.6px}}p{{margin:0 0 24px;co
             if path == "/api/mailboxes/delete-invalid":
                 return self.json_response(remove_invalid_mailboxes())
             if path == "/api/accounts/delete":
-                return self.json_response(remove_success_accounts(list(body.get("emails") or [])))
+                emails = list(body.get("emails") or [])
+                result = remove_success_accounts(emails)
+                result["inspection_rows"] = ACCOUNT_INSPECTION.remove_accounts(emails)
+                return self.json_response(result)
+            if path == "/api/account-inspection/start":
+                return self.json_response(ACCOUNT_INSPECTION.start(body.get("options") or {}))
+            if path == "/api/account-inspection/stop":
+                return self.json_response(ACCOUNT_INSPECTION.stop())
+            if path == "/api/account-inspection/refresh-invalid":
+                return self.json_response(
+                    start_invalid_credential_refresh(list(body.get("emails") or []))
+                )
+            if path == "/api/account-inspection/delete-abnormal":
+                return self.json_response(
+                    ACCOUNT_INSPECTION.delete_abnormal_accounts(
+                        list(body.get("emails") or [])
+                    )
+                )
+            if path == "/api/account-inspection/push-healthy":
+                return self.json_response(
+                    push_healthy_inspection_cpa(list(body.get("emails") or []))
+                )
             if path == "/api/cpa/push":
                 return self.json_response(
                     push_cpa_auths_to_management(

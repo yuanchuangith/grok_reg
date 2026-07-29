@@ -124,6 +124,23 @@ def mint_and_export(
                 "error": protocol_err or "protocol failed and no password for browser fallback",
                 "protocol_error": protocol_err,
             }
+        browser_cookies = cookies
+        if sso_val and not extract_sso_from_cookies(browser_cookies):
+            # The protocol path may validate the SSO session but still fail the
+            # device approval. Preserve that authenticated session for the
+            # browser fallback instead of forcing a second email/password login.
+            if isinstance(browser_cookies, dict):
+                browser_cookies = dict(browser_cookies)
+                browser_cookies.setdefault("sso", sso_val)
+                browser_cookies.setdefault("sso-rw", sso_val)
+            elif isinstance(browser_cookies, (list, tuple)):
+                browser_cookies = list(browser_cookies) + [
+                    {"name": "sso", "value": sso_val, "domain": ".x.ai", "path": "/"},
+                    {"name": "sso-rw", "value": sso_val, "domain": ".x.ai", "path": "/"},
+                ]
+            else:
+                browser_cookies = {"sso": sso_val, "sso-rw": sso_val}
+            log("browser fallback will inject existing SSO session")
         try:
             tokens = mint_with_browser(
                 email=email,
@@ -133,7 +150,7 @@ def mint_and_export(
                 headless=headless,
                 browser_timeout_sec=browser_timeout_sec,
                 force_standalone=force_standalone,
-                cookies=cookies,
+                cookies=browser_cookies,
                 reuse_browser=reuse_browser,
                 recycle_every=recycle_every,
                 poll_log=log,

@@ -1062,8 +1062,15 @@ def approve_device_code(
             _sleep(0.4)
 
         # Sign-in chooser
-        if "使用邮箱登录" in text or "Continue with email" in text:
-            if _click_exact(page, ["使用邮箱登录", "Continue with email", "Sign in with email"], log, real=False):
+        email_login_labels = [
+            "使用邮箱登录",
+            "Continue with email",
+            "Sign in with email",
+            "Login with email",
+            "Log in with email",
+        ]
+        if any(label in text for label in email_login_labels):
+            if _click_exact(page, email_login_labels, log, real=False):
                 _sleep(1.5)
                 phase = "email"
                 continue

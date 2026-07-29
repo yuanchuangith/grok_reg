@@ -29,6 +29,7 @@
         <button class="nav-item active" data-page="overview"><span>⌂</span>总览</button>
         <button class="nav-item" data-page="mailboxes"><span>✉</span>邮箱池</button>
         <button class="nav-item" data-page="accounts"><span>✓</span>成功账户</button>
+        <button class="nav-item" data-page="inspection"><span>◉</span>账户巡检</button>
         <button class="nav-item" data-page="failures"><span>!</span>失败记录</button>
         <button class="nav-item" data-page="proxy"><span>⇄</span>代理网络</button>
         <button class="nav-item" data-page="tasks"><span>▶</span>任务中心</button>
@@ -131,9 +132,60 @@
           </div>
           <article class="panel table-panel">
             <div class="table-wrap">
-              <table><thead><tr><th>账户</th><th>密码</th><th>SSO</th><th>CPA</th><th>可用模型</th><th>来源</th><th>操作</th></tr></thead><tbody id="accountRows"></tbody></table>
+              <table><thead><tr><th>账户</th><th>密码</th><th>SSO</th><th>CPA</th><th>巡检</th><th>可用模型</th><th>来源</th><th>操作</th></tr></thead><tbody id="accountRows"></tbody></table>
             </div>
             <div class="empty-state" id="accountEmpty"><span>✓</span><strong>还没有成功账户</strong><p>注册成功后会自动显示在这里。</p></div>
+          </article>
+        </section>
+
+        <section class="page" id="page-inspection">
+          <div class="toolbar panel compact">
+            <div><strong>账户巡检</strong><span id="inspectionStatus">尚未巡检</span></div>
+            <div class="toolbar-actions">
+              <div class="search-box"><span>⌕</span><input id="inspectionSearch" placeholder="搜索账户或原因"></div>
+              <select id="inspectionFilter" aria-label="巡检结果筛选">
+                <option value="all">全部结果</option>
+                <option value="healthy">健康</option>
+                <option value="reauth">认证失效</option>
+                <option value="permanent_invalid">永久失效</option>
+                <option value="permission_denied">权限被拒</option>
+                <option value="quota_exhausted">额度用尽</option>
+                <option value="model_unavailable">模型不可用</option>
+                <option value="probe_error">探测异常</option>
+              </select>
+              <select id="inspectionWorkers" aria-label="巡检并发数">
+                <option value="1">并发 1</option>
+                <option value="3" selected>并发 3</option>
+                <option value="5">并发 5</option>
+              </select>
+              <button class="danger-button" id="stopInspection" disabled>停止巡检</button>
+              <button class="danger-button" id="deleteAbnormalAccounts" disabled>删除所选异常</button>
+              <button class="secondary-button" id="refreshInvalidCredentials" disabled>批量重新获取授权</button>
+              <button class="secondary-button" id="pushHealthyCpa" disabled>推送健康 CPA</button>
+              <button class="primary-button" id="startInspection">开始巡检</button>
+            </div>
+          </div>
+
+          <div class="inspection-summary-grid">
+            <article class="panel inspection-summary success"><small>健康</small><strong id="inspectionHealthy">0</strong></article>
+            <article class="panel inspection-summary danger"><small>认证失效</small><strong id="inspectionReauth">0</strong></article>
+            <article class="panel inspection-summary danger"><small>永久失效</small><strong id="inspectionPermanent">0</strong></article>
+            <article class="panel inspection-summary warning"><small>权限被拒</small><strong id="inspectionPermission">0</strong></article>
+            <article class="panel inspection-summary orange"><small>额度用尽</small><strong id="inspectionQuota">0</strong></article>
+            <article class="panel inspection-summary violet"><small>模型不可用</small><strong id="inspectionModel">0</strong></article>
+            <article class="panel inspection-summary neutral"><small>探测异常</small><strong id="inspectionError">0</strong></article>
+          </div>
+
+          <article class="panel compact inspection-progress-panel">
+            <div><strong id="inspectionProgressText">等待开始</strong><small id="inspectionUpdatedAt">真实调用 grok-4.5 对话接口验证权限</small></div>
+            <div class="progress"><i id="inspectionProgress"></i></div>
+          </article>
+
+          <article class="panel table-panel inspection-table-panel">
+            <div class="table-wrap">
+              <table><thead><tr><th class="check-cell"><input type="checkbox" id="selectAllAbnormal" title="选择当前筛选结果中的异常账户"></th><th>账户</th><th>巡检结果</th><th>HTTP</th><th>原因</th><th>错误代码</th><th>巡检时间</th></tr></thead><tbody id="inspectionRows"></tbody></table>
+            </div>
+            <div class="empty-state" id="inspectionEmpty"><span>◉</span><strong>还没有巡检结果</strong><p>点击“开始巡检”执行真实对话权限验证。</p></div>
           </article>
         </section>
 

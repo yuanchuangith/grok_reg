@@ -82,6 +82,7 @@ DEFAULT_CONFIG = {
     "hotmail_alias_random_length": 8,
     "hotmail_alias_random_max_attempts": 200,
     "hotmail_max_aliases_per_account": 5,
+    "hotmail_single_account_per_mailbox": False,
     "hotmail_poll_interval": 5,
     "hotmail_recent_seconds": 900,
     "hotmail_imap_hosts": "outlook.office365.com,imap-mail.outlook.com",
@@ -1568,11 +1569,14 @@ def _hotmail_make_alias(main_email, alias_index, *, randomize=False):
 
 def hotmail_get_email_and_token():
     accounts = _hotmail_load_accounts()
+    single_account_per_mailbox = _config_bool(
+        config.get("hotmail_single_account_per_mailbox", False), default=False
+    )
     try:
         max_aliases = int(config.get("hotmail_max_aliases_per_account", 5) or 5)
     except Exception:
         max_aliases = 5
-    max_aliases = max(1, max_aliases)
+    max_aliases = 1 if single_account_per_mailbox else max(1, max_aliases)
     alias_mode = str(config.get("hotmail_alias_mode", "random") or "random").strip().lower()
     random_mode = alias_mode in ("random", "rand", "随机")
     try:
@@ -1596,7 +1600,7 @@ def hotmail_get_email_and_token():
             # 原邮箱仍优先尝试一次；之后 random 模式使用随机 plus alias。
             if _hotmail_alias_available(main_email):
                 candidate = main_email
-            elif random_mode:
+            elif not single_account_per_mailbox and random_mode:
                 for _ in range(random_max_attempts):
                     if _hotmail_count_consumed_for_main(main_email) >= max_aliases:
                         break
@@ -1604,7 +1608,7 @@ def hotmail_get_email_and_token():
                     if _hotmail_alias_available(alias_email):
                         candidate = alias_email
                         break
-            else:
+            elif not single_account_per_mailbox:
                 for alias_index in range(1, max_aliases):
                     alias_email = _hotmail_make_alias(main_email, alias_index)
                     if _hotmail_alias_available(alias_email):

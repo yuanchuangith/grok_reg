@@ -18,6 +18,8 @@
   "hotmail_alias_random_max_attempts": 200,
   "// hotmail_max_aliases_per_account": "每个主邮箱最多消耗多少个地址；包括原邮箱、成功别名、失败别名和当前运行占用别名。",
   "hotmail_max_aliases_per_account": 5,
+  "// hotmail_single_account_per_mailbox": "开启后每个 Hotmail/Outlook 主邮箱只允许分配一个注册地址，不再生成 +别名；成功、失败或运行中占用都会阻止再次分配该主邮箱。",
+  "hotmail_single_account_per_mailbox": false,
   "// hotmail_poll_interval": "Hotmail/Outlook IMAP 收验证码轮询间隔（秒）。",
   "hotmail_poll_interval": 5,
   "// hotmail_recent_seconds": "只扫描最近 N 秒邮件，避免读到旧验证码。",

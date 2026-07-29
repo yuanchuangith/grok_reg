@@ -3,6 +3,8 @@ const state = {
   mailboxes: [],
   mailboxPath: "",
   accounts: [],
+  inspection: null,
+  inspectionSelected: new Set(),
   failures: [],
   configFields: [],
   configDraft: {},
@@ -26,6 +28,7 @@ const pages = {
   overview: ["运行总览", "账户、邮箱和凭证的实时状态"],
   mailboxes: ["邮箱凭证池", "导入并管理 Hotmail / Outlook 四段凭证"],
   accounts: ["成功账户", "集中保留账号、SSO 和 CPA 凭证"],
+  inspection: ["账户巡检", "真实调用对话接口，区分认证失效、权限和额度问题"],
   failures: ["失败记录", "定位失败阶段并将邮箱重新加入可用池"],
   proxy: ["代理网络", "多订阅分组与静态认证 IP 的选取、随机和测活"],
   tasks: ["任务中心", "注册、补全 CPA 与查看实时日志"],
@@ -95,6 +98,10 @@ function taskLabel(status) {
   return ({idle:"空闲", running:"运行中", stopping:"正在停止", stopped:"已停止", completed:"已完成", failed:"运行失败"})[status] || status || "空闲";
 }
 
+function taskKindLabel(kind) {
+  return ({register:"注册账户", backfill:"补全 CPA", refresh_invalid:"重新获取授权", check:"运行检查"})[kind] || kind || "";
+}
+
 function renderOverview() {
   const item = state.overview;
   if (!item) return;
@@ -129,7 +136,7 @@ function renderOverview() {
   const task = item.task || {};
   const activity = $("#activityState");
   if (task.running) {
-    activity.innerHTML = `<div class="activity-orb"><span>▶</span></div><strong>${escapeHtml(task.kind === "register" ? "注册任务正在运行" : "CPA 补全正在运行")}</strong><p>开始于 ${escapeHtml(task.started_at || "刚刚")}</p>`;
+    activity.innerHTML = `<div class="activity-orb"><span>▶</span></div><strong>${escapeHtml(taskKindLabel(task.kind) || "任务")}正在运行</strong><p>开始于 ${escapeHtml(task.started_at || "刚刚")}</p>`;
   } else if (task.status && task.status !== "idle") {
     activity.innerHTML = `<div class="activity-orb"><span>✓</span></div><strong>最近任务${escapeHtml(taskLabel(task.status))}</strong><p>${escapeHtml(task.ended_at || "")}</p>`;
   } else {
@@ -182,6 +189,7 @@ function renderAccounts() {
     <td class="mono">${escapeHtml(item.password_masked)}</td>
     <td><span class="badge ${item.has_sso ? "success" : "warning"}">${item.has_sso ? "✓ 已保留" : "! 缺失"}</span></td>
     <td><div class="cpa-state"><span class="badge ${item.has_cpa ? "violet" : "neutral"}">${item.has_cpa ? "◆ " + escapeHtml(item.cpa_file) : "未生成"}</span>${item.has_cpa ? `<span class="badge ${item.cpa_pushed ? "success" : "warning"}" title="${item.cpa_pushed ? `已推送到 ${escapeHtml(item.cpa_push_target || "CPA")} · ${escapeHtml(item.cpa_pushed_at ? new Date(item.cpa_pushed_at).toLocaleString() : "")}` : "尚未推送，或凭证更新后需要重新推送"}">${item.cpa_pushed ? "✓ 已推送" : "! 待推送"}</span>` : ""}</div></td>
+    <td>${inspectionBadge(item.inspection, item.email)}</td>
     <td class="model-capability-cell">${renderAccountModels(item)}</td>
     <td>${escapeHtml(item.source)}</td><td><div class="table-row-actions"><button class="table-action credential-button" data-email="${escapeHtml(item.email)}">查看凭证</button>${item.has_cpa ? `<button class="table-action cpa-push-button" data-email="${escapeHtml(item.email)}" ${state.cpaPushRunning ? "disabled" : ""}>${item.cpa_pushed ? "重新推送" : "推送 CPA"}</button><button class="table-action refresh-credential-button" data-email="${escapeHtml(item.email)}">刷新凭证</button><button class="table-action refresh-models-button" data-email="${escapeHtml(item.email)}">${item.models?.length ? "刷新模型" : "获取模型"}</button><button class="table-action refresh-quota-button" data-email="${escapeHtml(item.email)}">刷新额度状态</button>` : `<button class="table-action cpa-backfill-button" data-email="${escapeHtml(item.email)}">获取 CPA</button>`}<button class="table-action account-delete-button" data-email="${escapeHtml(item.email)}">删除账户</button></div></td>
   </tr>`).join("");
@@ -196,6 +204,87 @@ function renderAccounts() {
     const labels = {pending:"当前没有未推送账户", pushed:"当前没有已推送账户", all:"还没有成功账户"};
     $("#accountEmpty strong").textContent = labels[state.accountPushGroup] || labels.all;
   }
+}
+
+const inspectionLabels = {
+  healthy: ["success", "健康"],
+  reauth: ["danger", "认证失效"],
+  permanent_invalid: ["danger", "永久失效"],
+  permission_denied: ["warning", "权限被拒"],
+  quota_exhausted: ["warning", "额度用尽"],
+  model_unavailable: ["violet", "模型不可用"],
+  probe_error: ["neutral", "探测异常"],
+};
+
+function inspectionBadge(item, email = "") {
+  const classification = item?.classification || "";
+  const meta = inspectionLabels[classification] || ["neutral", "未巡检"];
+  const title = item?.reason ? `${item.reason}${item.status ? ` · HTTP ${item.status}` : ""}` : "尚未执行真实对话巡检";
+  if (classification === "permanent_invalid" && email) {
+    return `<button type="button" class="badge inspection-result danger permanent-invalid-delete" data-email="${escapeHtml(email)}" title="${escapeHtml(`${title} · 点击删除账户`)}">永久失效 · 删除</button>`;
+  }
+  return `<span class="badge inspection-result ${meta[0]}" title="${escapeHtml(title)}">${meta[1]}</span>`;
+}
+
+function renderInspection() {
+  const data = state.inspection || {items:[], summary:{}, total:0, completed:0, status:"idle"};
+  const summary = data.summary || {};
+  $("#inspectionHealthy").textContent = summary.healthy || 0;
+  $("#inspectionReauth").textContent = summary.reauth || 0;
+  $("#inspectionPermanent").textContent = summary.permanent_invalid || 0;
+  $("#inspectionPermission").textContent = summary.permission_denied || 0;
+  $("#inspectionQuota").textContent = summary.quota_exhausted || 0;
+  $("#inspectionModel").textContent = summary.model_unavailable || 0;
+  $("#inspectionError").textContent = summary.probe_error || 0;
+
+  const statusLabels = {idle:"尚未巡检", running:"巡检运行中", stopping:"正在停止", stopped:"巡检已停止", completed:"巡检已完成", failed:"巡检失败"};
+  $("#inspectionStatus").textContent = `${statusLabels[data.status] || data.status || "尚未巡检"} · ${data.completed || 0}/${data.total || 0}`;
+  const progress = data.total ? Math.round((data.completed || 0) / data.total * 100) : 0;
+  $("#inspectionProgress").style.width = `${progress}%`;
+  $("#inspectionProgressText").textContent = data.running ? `正在巡检 ${data.completed || 0}/${data.total || 0}（${progress}%）` : data.total ? `已完成 ${data.completed || 0}/${data.total || 0}` : "等待开始";
+  $("#inspectionUpdatedAt").textContent = data.updated_at ? `最近更新：${new Date(data.updated_at).toLocaleString()} · 模型 ${data.model || "grok-4.5"}` : "真实调用 grok-4.5 对话接口验证权限";
+  $("#startInspection").disabled = Boolean(data.running);
+  $("#stopInspection").disabled = !data.running;
+
+  const query = $("#inspectionSearch").value.trim().toLowerCase();
+  const filter = $("#inspectionFilter").value;
+  const items = (data.items || []).filter(item => {
+    if (filter !== "all" && item.classification !== filter) return false;
+    return `${item.email} ${item.reason || ""} ${item.error_code || ""} ${item.error_message || ""}`.toLowerCase().includes(query);
+  });
+  $("#inspectionRows").innerHTML = items.map(item => {
+    const abnormal = Boolean(item.classification) && item.classification !== "healthy";
+    const checked = abnormal && state.inspectionSelected.has(item.email);
+    return `<tr>
+      <td class="check-cell"><input type="checkbox" class="inspection-row-checkbox" value="${escapeHtml(item.email)}" ${abnormal ? "" : "disabled"} ${checked ? "checked" : ""}></td>
+      <td><div class="email-cell"><span class="avatar">${escapeHtml(item.email.slice(0,1).toUpperCase())}</span><div><strong>${escapeHtml(item.email)}</strong><small>${escapeHtml(item.file || "")}</small></div></div></td>
+      <td>${inspectionBadge(item)}</td>
+      <td class="mono">${item.status || "—"}</td>
+      <td class="inspection-reason" title="${escapeHtml(item.error_message || item.reason || "")}">${escapeHtml(item.reason || "—")}</td>
+      <td class="mono inspection-code" title="${escapeHtml(item.error_code || "")}">${escapeHtml(item.error_code || "—")}</td>
+      <td>${escapeHtml(item.checked_at ? new Date(item.checked_at).toLocaleString() : "—")}</td>
+    </tr>`;
+  }).join("");
+  $("#inspectionEmpty").classList.toggle("visible", items.length === 0);
+  const allItems = data.items || [];
+  const healthyItems = allItems.filter(item => item.classification === "healthy");
+  const abnormalItems = allItems.filter(item => item.classification && item.classification !== "healthy");
+  const visibleAbnormalItems = items.filter(item => item.classification && item.classification !== "healthy");
+  const reauthItems = allItems.filter(item => item.classification === "reauth");
+  const selectedAbnormal = abnormalItems.filter(item => state.inspectionSelected.has(item.email));
+  const selectedReauth = reauthItems.filter(item => state.inspectionSelected.has(item.email));
+  const hasSelection = selectedAbnormal.length > 0;
+  $("#deleteAbnormalAccounts").disabled = data.running || selectedAbnormal.length === 0;
+  $("#deleteAbnormalAccounts").textContent = selectedAbnormal.length ? `删除所选异常 (${selectedAbnormal.length})` : "删除所选异常";
+  $("#refreshInvalidCredentials").disabled = data.running || reauthItems.length === 0 || (hasSelection && selectedReauth.length === 0);
+  $("#refreshInvalidCredentials").textContent = selectedReauth.length ? `重新获取所选授权 (${selectedReauth.length})` : `批量重新获取授权${reauthItems.length ? ` (${reauthItems.length})` : ""}`;
+  $("#pushHealthyCpa").disabled = data.running || state.cpaPushRunning || healthyItems.length === 0;
+  $("#pushHealthyCpa").textContent = state.cpaPushRunning ? "正在推送健康 CPA…" : `推送健康 CPA${healthyItems.length ? ` (${healthyItems.length})` : ""}`;
+  const selectAll = $("#selectAllAbnormal");
+  const selectedVisible = visibleAbnormalItems.filter(item => state.inspectionSelected.has(item.email)).length;
+  selectAll.disabled = data.running || visibleAbnormalItems.length === 0;
+  selectAll.checked = visibleAbnormalItems.length > 0 && selectedVisible === visibleAbnormalItems.length;
+  selectAll.indeterminate = selectedVisible > 0 && selectedVisible < visibleAbnormalItems.length;
 }
 
 function modelRateLimitText(test) {
@@ -397,7 +486,7 @@ function renderTask(task) {
   const pill = $("#taskPill");
   pill.classList.toggle("running", task.running);
   $("span", pill).textContent = taskLabel(task.status);
-  $("#taskStatusText").textContent = `${task.kind ? task.kind.toUpperCase() + " · " : ""}${taskLabel(task.status)}`;
+  $("#taskStatusText").textContent = `${task.kind ? taskKindLabel(task.kind) + " · " : ""}${taskLabel(task.status)}`;
   $("#stopTask").disabled = !task.running;
   const signature = JSON.stringify(task.logs || []);
   if (signature !== state.taskSignature) {
@@ -432,6 +521,13 @@ async function loadAccounts() {
   renderAccounts();
 }
 
+async function loadInspection() {
+  state.inspection = await api("/api/account-inspection");
+  const validEmails = new Set((state.inspection.items || []).filter(item => item.classification && item.classification !== "healthy").map(item => item.email));
+  state.inspectionSelected = new Set([...state.inspectionSelected].filter(email => validEmails.has(email)));
+  renderInspection();
+}
+
 async function loadFailures() {
   const data = await api("/api/failures");
   state.failures = data.items || [];
@@ -460,7 +556,7 @@ async function loadTask() {
 
 async function refreshAll(showToast = false) {
   try {
-    await Promise.all([loadOverview(), loadMailboxes(), loadAccounts(), loadFailures(), loadTask(), loadProxyPool()]);
+    await Promise.all([loadOverview(), loadMailboxes(), loadAccounts(), loadInspection(), loadFailures(), loadTask(), loadProxyPool()]);
     if (showToast) toast("数据已刷新");
   } catch (error) {
     $("#serverText").textContent = "连接失败";
@@ -522,6 +618,8 @@ document.addEventListener("click", async event => {
       startTask("backfill", {limit:1, email, probe:true, refresh_existing:true});
     }
   }
+  const permanentInvalidDelete = event.target.closest(".permanent-invalid-delete");
+  if (permanentInvalidDelete) deleteSuccessAccount(permanentInvalidDelete.dataset.email);
   const accountDelete = event.target.closest(".account-delete-button");
   if (accountDelete) deleteSuccessAccount(accountDelete.dataset.email);
   const cpaPush = event.target.closest(".cpa-push-button");
@@ -617,7 +715,7 @@ async function deleteSuccessAccount(email) {
   try {
     const result = await api("/api/accounts/delete", {method:"POST", body:JSON.stringify({emails:[email]})});
     toast(`删除完成：账户记录 ${result.account_rows} 条、邮箱配置 ${result.mailbox_rows} 条、CPA ${result.cpa_files} 个`);
-    await Promise.all([loadAccounts(), loadMailboxes(), loadFailures(), loadOverview()]);
+    await Promise.all([loadAccounts(), loadMailboxes(), loadFailures(), loadOverview(), loadInspection()]);
   } catch (error) { toast(error.message, "error"); }
 }
 
@@ -665,9 +763,98 @@ $("#pushCpa").addEventListener("click", pushAllCpa);
 }));
 $("#mailboxSearch").addEventListener("input", renderMailboxes);
 $("#accountSearch").addEventListener("input", renderAccounts);
+$("#inspectionSearch").addEventListener("input", renderInspection);
+$("#inspectionFilter").addEventListener("change", renderInspection);
 $("#failureSearch").addEventListener("input", renderFailures);
 $("#selectAllMailboxes").addEventListener("change", event => $$(".mail-check").forEach(item => item.checked = event.target.checked));
 $("#selectAllFailures").addEventListener("change", event => $$(".failure-check").forEach(item => item.checked = event.target.checked));
+$("#selectAllAbnormal").addEventListener("change", event => {
+  const query = $("#inspectionSearch").value.trim().toLowerCase();
+  const filter = $("#inspectionFilter").value;
+  const emails = (state.inspection?.items || []).filter(item => {
+    if (!item.classification || item.classification === "healthy") return false;
+    if (filter !== "all" && item.classification !== filter) return false;
+    return `${item.email} ${item.reason || ""} ${item.error_code || ""} ${item.error_message || ""}`.toLowerCase().includes(query);
+  }).map(item => item.email);
+  if (event.target.checked) emails.forEach(email => state.inspectionSelected.add(email));
+  else emails.forEach(email => state.inspectionSelected.delete(email));
+  renderInspection();
+});
+$("#inspectionRows").addEventListener("change", event => {
+  if (!event.target.classList.contains("inspection-row-checkbox")) return;
+  if (event.target.checked) state.inspectionSelected.add(event.target.value);
+  else state.inspectionSelected.delete(event.target.value);
+  renderInspection();
+});
+
+$("#startInspection").addEventListener("click", async () => {
+  try {
+    state.inspectionSelected.clear();
+    state.inspection = await api("/api/account-inspection/start", {method:"POST", body:JSON.stringify({options:{workers:Number($("#inspectionWorkers").value || 3)}})});
+    renderInspection();
+    toast(`账户巡检已启动，共 ${state.inspection.total || 0} 个凭证`);
+  } catch (error) { toast(error.message, "error"); }
+});
+
+$("#stopInspection").addEventListener("click", async () => {
+  try {
+    state.inspection = await api("/api/account-inspection/stop", {method:"POST", body:"{}"});
+    renderInspection();
+    toast("已请求停止账户巡检");
+  } catch (error) { toast(error.message, "error"); }
+});
+
+$("#deleteAbnormalAccounts").addEventListener("click", async () => {
+  const abnormal = new Set((state.inspection?.items || []).filter(item => item.classification && item.classification !== "healthy").map(item => item.email));
+  const emails = [...state.inspectionSelected].filter(email => abnormal.has(email));
+  if (!emails.length) return toast("请先选择要删除的异常账户", "error");
+  if (!confirm(`确定删除所选 ${emails.length} 个异常账户吗？\n\n将同时删除成功账户记录、CPA 凭证、模型缓存、相关失败记录及对应主邮箱配置；已使用邮箱标记会保留。健康账户不会被删除。此操作不可撤销。`)) return;
+  try {
+    const result = await api("/api/account-inspection/delete-abnormal", {method:"POST", body:JSON.stringify({emails})});
+    emails.forEach(email => state.inspectionSelected.delete(email));
+    toast(`异常账户删除完成：成功账户记录 ${result.account_rows} 条、邮箱配置 ${result.mailbox_rows} 条、CPA ${result.cpa_files} 个、巡检结果 ${result.inspection_rows} 条`);
+    await Promise.all([loadInspection(), loadAccounts(), loadMailboxes(), loadFailures(), loadOverview()]);
+  } catch (error) { toast(error.message, "error"); }
+});
+
+$("#refreshInvalidCredentials").addEventListener("click", async () => {
+  const all = (state.inspection?.items || []).filter(item => item.classification === "reauth").map(item => item.email);
+  const selectedAll = [...state.inspectionSelected];
+  const selected = selectedAll.filter(email => all.includes(email));
+  if (selectedAll.length && !selected.length) return toast("所选账户中没有认证失效凭证", "error");
+  const emails = selectedAll.length ? selected : all;
+  if (!emails.length) return toast("当前没有认证失效凭证", "error");
+  if (!confirm(`将为 ${emails.length} 个认证失效账户重新获取授权。系统会先尝试 refresh_token，失败后执行完整 OIDC 重取，并在真实对话验证成功前保留旧凭证。是否继续？`)) return;
+  try {
+    const task = await api("/api/account-inspection/refresh-invalid", {method:"POST", body:JSON.stringify({emails})});
+    renderTask(task);
+    navigate("tasks");
+    toast(`已启动 ${task.refresh_count || emails.length} 个账户的重新授权任务`);
+  } catch (error) { toast(error.message, "error"); }
+});
+
+$("#pushHealthyCpa").addEventListener("click", async () => {
+  const healthy = (state.inspection?.items || []).filter(item => item.classification === "healthy").map(item => item.email);
+  if (!healthy.length) return toast("当前没有巡检健康账户", "error");
+  if (!confirm(`将推送 ${healthy.length} 个巡检健康账户的 CPA 凭证。已成功推送且内容未变化的凭证会自动跳过。是否继续？`)) return;
+  state.cpaPushRunning = true;
+  renderInspection();
+  renderAccounts();
+  try {
+    const result = await api("/api/account-inspection/push-healthy", {method:"POST", body:"{}"});
+    if (!result.ok) {
+      const detail = (result.failures || []).slice(0, 2).map(item => `${item.name}: ${item.error}`).join("；");
+      throw new Error(`健康 CPA 推送部分失败：已上传 ${result.pushed}/${result.total}，已热加载 ${result.recognized}${detail ? `；${detail}` : ""}`);
+    }
+    if (!result.pending) toast(`健康账户 CPA 均已推送，跳过 ${result.skipped || 0} 个未变化凭证`);
+    else toast(`健康 CPA 已推送到 ${result.target}：新增 ${result.recognized} 个，跳过 ${result.skipped || 0} 个`);
+  } catch (error) {
+    toast(error.message, "error");
+  } finally {
+    state.cpaPushRunning = false;
+    await Promise.all([loadInspection(), loadAccounts()]);
+  }
+});
 
 $("#openImport").addEventListener("click", () => openModal("#importModal"));
 $("#closeImport").addEventListener("click", () => closeModal("#importModal"));
@@ -873,6 +1060,10 @@ setInterval(async () => {
     await loadTask();
     if ($("#page-overview").classList.contains("active")) await loadOverview();
     if ($("#page-accounts").classList.contains("active")) await loadAccounts();
+    if ($("#page-inspection").classList.contains("active")) {
+      await loadInspection();
+      if (!state.inspection?.running) await loadAccounts();
+    }
   } catch { /* transient server restart */ }
 }, 1800);
 
